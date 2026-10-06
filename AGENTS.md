@@ -41,6 +41,43 @@ Concretely, in order of preference:
 3. **Cap each wait below the operator's patience** (~8 minutes) and immediately
    issue the next wait. Long silence reads as a hang even when it is not.
 
+## Never rewrite a file with `Set-Content` and an array
+
+PowerShell's `Set-Content -Value <string[]> -NoNewline` writes the array joined
+by the **empty string**. Every newline is lost, so a 290-line file becomes one
+line, and because dotenv treats everything after the first `#` as a comment the
+file then sets **no variables at all**.
+
+This happened to `.env` in this repo, which is gitignored — so git could not
+restore it. Recovery took four attempts because the lost newlines destroyed real
+information: a comment word fused onto a key (`# CRITICAL` + `LOG_LEVEL=INFO`
+became `CRITICALLOG_LEVEL`) is not recoverable structurally, and a lookbehind
+rejects valid matches when a comment ends in a letter. What worked was treating
+`.env.example`'s key list as authoritative and matching known keys as **suffixes**
+of the tokens in the mangled text.
+
+Two near-misses the recovery caught, both of which would have been worse than
+the corruption:
+
+* `MODEL_OVERRIDES` was un-commented. It routes every builder role at
+  `qwen/qwen3.8-27b:free` — the model that answers *"This model is unavailable
+  for free"*. Every build would have failed at its first call.
+* `SECRET_SCRUB_TARGETS` was being harvested as a live secret value, because its
+  name matches `SECRET*`. Its value is a **path list**, and the same string is
+  documented in `.env.example`, so `--preflight scan --committed` reported a
+  leak in a tracked file. Redaction would also have blanked the list of files
+  the operator is supposed to scrub.
+
+**Rules that follow:**
+
+* To edit a multi-line file, use the `edit` tool. Not `Set-Content`.
+* If a rewrite is unavoidable, pipe (`Get-Content f | % {...} | Set-Content f`),
+  which writes one line per item. Never `-Value $array -NoNewline`.
+* After touching `.env`, verify: key count, every credential present and
+  non-empty, `python -c "import config; print(config.X)"` for the settings you
+  changed, and `python main.py --models verify` for a live call.
+* Diff the key *set* before and after. Value comparison is not enough.
+
 ## Housekeeping that prevents confusing "stuck" with "idle"
 
 - Only **one** orchestrator may hold a workspace (`main.py` enforces an

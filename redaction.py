@@ -102,6 +102,28 @@ _SECRET_NAME_RE = re.compile(
     r"|PASS(?:PHRASE)?|CREDENTIALS?|AUTH)(?:$|[_\-.0-9])",
     re.IGNORECASE)
 
+#: Names that *look* credential-shaped but hold a list of paths or names rather
+#: than a secret.  ``SECRET_SCRUB_TARGETS`` is the live case: its value is
+#: ``.shared_workspace/anti_patterns.json``, a path.  Harvesting it as a secret
+#: caused two real problems -- the same path string is documented in
+#: ``.env.example``, so ``--preflight scan --committed`` reported a leak in a
+#: tracked file, and redaction would blank the list of files the operator is
+#: supposed to scrub, hiding the very diagnostic that matters.
+#:
+#: This is a precision fix for a well-understood class rather than a loosening
+#: of :func:`_usable_secret`, which stays biased toward including.
+_NON_SECRET_NAME_RE = re.compile(
+    r"(?:_TARGETS|_PATHS|_FILES|_DIRS|_WHITELIST|_ALLOWLIST|_DENYLIST"
+    r"|_PREFIXES|_SUFFIXES|_NAMES|_KEYS_LIST)$",
+    re.IGNORECASE)
+
+
+def _is_secret_bearing_name(name: str) -> bool:
+    """True when *name* denotes an actual secret rather than a list of them."""
+    return bool(_SECRET_NAME_RE.search(name or "")) and not _NON_SECRET_NAME_RE.search(
+        name or "")
+
+
 #: Directories never walked by :func:`scan_tree`.
 _SKIP_DIRS = frozenset({
     ".git", ".pytest_cache", "__pycache__", ".ruff_cache", ".mypy_cache",
@@ -241,7 +263,7 @@ def _env_secret_values(workspace_root: Optional[Path]) -> List[str]:
     values: List[str] = []
     try:
         for name, value in os.environ.items():
-            if _SECRET_NAME_RE.search(name or ""):
+            if _is_secret_bearing_name(name or ""):
                 values.append(value)
     except Exception:  # noqa: BLE001 -- never raise out of a redaction call
         pass
@@ -259,7 +281,7 @@ def _env_secret_values(workspace_root: Optional[Path]) -> List[str]:
 
     for env_path in env_paths:
         for name, value in _parse_env_file(env_path).items():
-            if _SECRET_NAME_RE.search(name):
+            if _is_secret_bearing_name(name):
                 values.append(value)
     return values
 
@@ -273,7 +295,7 @@ def _env_candidates(workspace_root: Optional[Path]) -> Dict[str, str]:
     found: Dict[str, str] = {}
     try:
         for name, value in os.environ.items():
-            if _SECRET_NAME_RE.search(name or ""):
+            if _is_secret_bearing_name(name or ""):
                 found.setdefault(name, value)
     except Exception:  # noqa: BLE001
         pass
@@ -289,7 +311,7 @@ def _env_candidates(workspace_root: Optional[Path]) -> Dict[str, str]:
         pass
     for env_path in env_paths:
         for name, value in _parse_env_file(env_path).items():
-            if _SECRET_NAME_RE.search(name):
+            if _is_secret_bearing_name(name):
                 found.setdefault(name, value)
     return found
 
