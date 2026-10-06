@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 
 import config
 import model_router
+import providers
+import pytest
 from quota_governor import get_governor
 
 
@@ -165,3 +167,116 @@ def test_verify_providers_reports_ok_and_errors(clean_env, tmp_path):
         model_router.verify_providers(_FakeLLM(), tmp_path))
     assert len(results) == 1
     assert results[0]["provider"] == "groq" and results[0]["ok"]
+
+
+# ============== A probe is the designated cleanup path, so it must clean up
+def test_probe_takes_a_withdrawn_model_out_of_rotation(clean_env, tmp_path,
+                                                      monkeypatch):
+    """Found on the first live probe run.
+
+    ``cloudflare:@cf/moonshotai/kimi-k2.6`` answered HTTP 403 "is not available
+    on the Workers Free plan".  That is an availability fact about the model,
+    not a transient error -- but ``raw_complete`` (the probe path) recorded it
+    as a generic failure and left the model in the catalog.  So the one command
+    an operator runs to clean the roster up did not clean it.
+    """
+    from agent_roles import LLMClient
+
+    monkeypatch.setattr(config, "FREE_MODEL_ROUTING", True)
+    monkeypatch.setattr(config, "MODEL_UNAVAILABLE_COOLDOWN_S", 900)
+    client = LLMClient(tmp_path)
+
+    class Gone(Exception):
+        status_code = 403
+
+    async def boom(*a, **k):
+        raise Gone("Model @cf/moonshotai/kimi-k2.6 is not available on the "
+                   "Workers Free plan")
+
+    monkeypatch.setattr(LLMClient, "_call_provider", boom)
+    monkeypatch.setattr(model_router.providers, "provider_by_key",
+                        lambda key: providers.ProviderDef(key="cloudflare", label="cf", base_url="u", api_key_env="X", models=(), rpm=30, priority=25))
+    monkeypatch.setattr(model_router.providers, "has_credentials",
+                        lambda p: True)
+
+    with pytest.raises(Gone):
+        asyncio.run(client.raw_complete("cloudflare",
+                                        "@cf/moonshotai/kimi-k2.6",
+                                        "s", "u"))
+    assert model_router.unavailable_models(tmp_path), (
+        "a probe must take a withdrawn model out of rotation")
+
+
+def test_probe_does_not_mark_a_rate_limit_unavailable(clean_env, tmp_path,
+                                                      monkeypatch):
+    """429 is congestion. Marking it dead would empty the pool under load."""
+    from agent_roles import LLMClient
+
+    monkeypatch.setattr(config, "FREE_MODEL_ROUTING", True)
+    client = LLMClient(tmp_path)
+
+    class Busy(Exception):
+        status_code = 429
+
+    async def boom(*a, **k):
+        raise Busy("rate limit exceeded")
+
+    monkeypatch.setattr(LLMClient, "_call_provider", boom)
+    monkeypatch.setattr(model_router.providers, "provider_by_key",
+                        lambda key: providers.ProviderDef(key="groq", label="g", base_url="u", api_key_env="X", models=(), rpm=30, priority=20))
+    monkeypatch.setattr(model_router.providers, "has_credentials",
+                        lambda p: True)
+
+    with pytest.raises(Busy):
+        asyncio.run(client.raw_complete("groq", "some/model", "s", "u"))
+    assert not model_router.unavailable_models(tmp_path), (
+        "a 429 must never be recorded as unavailability")
+
+def test_refresh_returns_a_real_count(clean_env, tmp_path):
+    """``--models refresh`` used to print "0 free models" after adding 610.
+
+    ``refresh_catalog`` never set a ``count`` key and the CLI read
+    ``result.get("count", 0)``, so the one command whose entire job is to report
+    what changed reported a confident zero on every run -- while the real diff
+    (+610 / -7) went only to the JSONL log.  Pinned because the value is now
+    what an operator reads before trusting their roster.
+    """
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(model_router.providers, "all_provider_defs", list)
+    monkey.setattr(model_router.providers, "has_credentials", lambda p: False)
+    result = model_router.refresh_catalog(workspace_root=tmp_path)
+    assert "count" in result, "the CLI reads result['count']; it must exist"
+    assert isinstance(result["count"], int)
+    assert "added_count" in result and "removed_count" in result
+    assert result["added_count"] == len(result["added"])
+    assert result["removed_count"] == len(result["removed"])
+    monkey.undo()
+
+
+def test_refresh_count_matches_the_per_provider_counts(clean_env, tmp_path):
+    monkey = pytest.MonkeyPatch()
+
+    def one_provider():
+        return [providers.ProviderDef(
+            key="groq", label="g", base_url="u", api_key_env="X",
+            models=(), rpm=30, priority=20,
+            supports_models_endpoint=True)]
+
+    monkey.setattr(model_router.providers, "all_provider_defs", one_provider)
+    monkey.setattr(model_router.providers, "has_credentials", lambda p: True)
+    monkey.setattr(model_router, "_models_url",
+                   lambda p: "https://example.invalid/v1/models")
+
+    class M:
+        def __init__(self, name):
+            self.model = name
+
+    monkey.setattr(model_router, "_fetch_models",
+                   lambda p, t: [{"id": "a/model"}, {"id": "b/model"}])
+    monkey.setattr(model_router, "_models_from_generic_list",
+                   lambda p, entries: [M(e["id"]) for e in entries])
+    result = model_router.refresh_catalog(workspace_root=tmp_path)
+    assert result["ok"] is True
+    assert result["count"] == 2, result
+    assert result["providers"]["groq"]["count"] == 2
+    monkey.undo()

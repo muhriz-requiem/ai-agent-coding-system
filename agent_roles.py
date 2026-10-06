@@ -919,6 +919,19 @@ class LLMClient:
             else:
                 model_router.record_call(provider_key, model, "probe", "error",
                                          workspace_root=self.workspace_root)
+                # v2.9.1: a probe is the designated way to clean the roster up,
+                # so it is exactly where a withdrawn model should be taken out
+                # of rotation. It was not: the error was recorded as a generic
+                # failure and the model kept its catalog entry. Observed on the
+                # first live probe run --
+                #   cloudflare:@cf/moonshotai/kimi-k2.6 -> HTTP 403
+                #   "is not available on the Workers Free plan"
+                # which is an availability fact and was recorded as if it were
+                # a transient error.
+                if model_router.error_says_model_gone(exc):
+                    model_router.mark_model_unavailable(
+                        provider_key, model, str(exc)[:200],
+                        self.workspace_root)
             governor.record(pdef, tokens=0, outcome="error", role="probe")
             raise
         governor.record(pdef, tokens=tokens, outcome="ok", role="probe")

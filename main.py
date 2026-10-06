@@ -326,7 +326,25 @@ def _models_command(action: str, workspace: Path) -> int:
     if action == "refresh":
         result = model_router.refresh_catalog(workspace_root=workspace)
         if result.get("ok"):
-            print(f"catalog refreshed: {result.get('count', 0)} free models")
+            # v2.9.1: report the diff, because a roster change is the entire
+            # reason to run this. It used to print only a model count that was
+            # hardcoded to 0 by a missing return key, while the real diff
+            # (+610 / -7 on the first live run) went only to the JSONL log.
+            added = int(result.get("added_count", 0) or 0)
+            removed = int(result.get("removed_count", 0) or 0)
+            print(f"catalog refreshed: {result.get('count', 0)} model(s) "
+                  f"across {result.get('providers_ok', 0)} provider(s)")
+            print(f"  live catalog vs seed roster: +{added} present live but "
+                  f"not seeded, -{removed} seeded but no longer listed")
+            for key, row in (result.get("providers") or {}).items():
+                if row.get("ok"):
+                    continue
+                why = row.get("skipped") or row.get("error") or "unknown"
+                print(f"  {key}: NOT refreshed ({str(why)[:90]})")
+            if added or removed:
+                print("  Removals are reported, never applied to the seed "
+                      "roster: absence from a provider's list is not proof a "
+                      "model is dead.")
             return 0
         print(f"catalog refresh failed: {result.get('error')}", file=sys.stderr)
         return 1

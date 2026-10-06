@@ -372,8 +372,18 @@ def refresh_catalog(timeout: int = 15,
     total = sum(1 for r in results.values() if r.get("ok"))
     log_event("INFO", "model_catalog_refreshed",
               {"providers_ok": total, "providers": list(results)})
-    return {"ok": total > 0, "providers": results,
-            "added": added_all, "removed": removed_all}
+    # v2.9.1: ``count`` used to be absent from this return, and the CLI read
+    # ``result.get("count", 0)`` -- so ``--models refresh`` printed "catalog
+    # refreshed: 0 free models" after a refresh that added 610 models and
+    # removed 7. The command whose entire job is to report what changed
+    # reported zero, confidently, and the diff was only visible in the JSONL
+    # log. A number that is always zero is worse than no number.
+    total_models = sum(int(r.get("count", 0) or 0)
+                       for r in results.values() if r.get("ok"))
+    return {"ok": total > 0, "providers": results, "count": total_models,
+            "providers_ok": total,
+            "added": added_all, "removed": removed_all,
+            "added_count": len(added_all), "removed_count": len(removed_all)}
 
 
 def _persisted_models(pdef: ProviderDef,
