@@ -1,0 +1,477 @@
+"""Entry point for the Enterprise Multi-Agent Coding System.
+
+Usage:
+    python main.py          # run the full orchestration loop (Ctrl+C to stop)
+    python main.py --once   # single orchestration pass, then exit (testing)
+    python main.py --help   # CLI help (the only place raw prints are allowed)
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import os
+import sys
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional
+
+import config
+import providers
+from logger import log_event
+from super_orchestrator import SuperOrchestrator
+
+try:  # OS-level locks: the OS releases them automatically on process death.
+    import msvcrt
+except ImportError:  # pragma: no cover -- non-Windows
+    msvcrt = None
+try:
+    import fcntl
+except ImportError:  # pragma: no cover -- Windows
+    fcntl = None
+
+
+@contextmanager
+def _orchestrator_lock(workspace: Path) -> Iterator[None]:
+    """Refuse to start a second orchestrator loop on the same workspace.
+
+    Two orchestrator suites processing one workspace race on the task
+    boards, snapshots and manifest -- the losing loop's rollback then
+    resurrects the winning loop's files (observed in production as a
+    rolled-back module that kept coming back). The lock is advisory but
+    OS-owned: it is released automatically when the holder dies, so no
+    stale-lock cleanup is needed.
+    """
+    lock_path = workspace / ".system" / "orchestrator.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+")
+    locked = False
+    try:
+        # msvcrt locks the byte range at the CURRENT file position; "a+"
+        # opens at EOF, which is non-zero once a previous holder wrote its
+        # pid.  A second instance would then lock a different byte and
+        # succeed.  Always lock the fixed range starting at byte 0.
+        handle.seek(0)
+        if msvcrt is not None:
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                locked = True
+            except OSError:
+                locked = False
+        elif fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                locked = False
+        else:  # pragma: no cover -- no lock API available
+            locked = True
+        if not locked:
+            print(
+                "error: another orchestrator instance is already running on "
+                f"this workspace (lock: {lock_path}). Stop it first, e.g. "
+                "via its dashboard console or Task Manager.",
+                file=sys.stderr)
+            raise SystemExit(2)
+        handle.seek(0)
+        handle.write(f"{os.getpid()}\n")
+        handle.truncate()
+        handle.flush()
+        log_event("INFO", "orchestrator_lock_acquired",
+                  {"pid": os.getpid()})
+        yield
+    finally:
+        if locked:
+            try:
+                if msvcrt is not None:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                elif fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        handle.close()
+
+
+def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description=f"Enterprise Multi-Agent Coding System {providers.VERSION} "
+                    "(3-tier hierarchical orchestration, free multi-provider "
+                    "routing, offline DEMO_MODE).")
+    parser.add_argument(
+        "--once", action="store_true",
+        help="run a single orchestration pass (process all currently pending "
+             "tasks once) and then exit -- useful for testing and CI")
+    parser.add_argument(
+        "--new-project", metavar="NAME",
+        help="scaffold projects/NAME (task board, src/, tests/) and exit -- "
+             "then edit .agent/task_board.json to describe your work, or pair "
+             "it with --goal to have the system author the board itself")
+    parser.add_argument(
+        "--goal", metavar="TEXT",
+        help="the project's one-paragraph goal, written to projects/NAME/"
+             "goal.txt. With --new-project this becomes the board's origin: "
+             "the Spec Author drafts the tests-first breakdown on first run. "
+             "Without --new-project it is recorded for an existing project.")
+    parser.add_argument(
+        "--author-plan", action="store_true",
+        help="with --new-project and --goal: author the breakdown now and "
+             "print it, instead of waiting for the first orchestration run. "
+             "Does not start the orchestrator")
+    parser.add_argument(
+        "--feed", action="store_true",
+        help="open the watch-only live event feed window (Ctrl+C closes it)")
+    parser.add_argument(
+        "--cmd", action="store_true",
+        help="open the dedicated command console (pause/resume/status/skip/"
+             "retry/note/ask/exit)")
+    parser.add_argument(
+        "--dashboard", action="store_true",
+        help="run the orchestrator headless and spawn BOTH dashboard windows "
+             "(event feed + command console) as separate terminals")
+    parser.add_argument(
+        "--models", metavar="ACTION",
+        choices=["status", "verify", "refresh", "probe", "cache-clear"],
+        help="free-model capacity layer: status (rankings + quota), verify "
+             "(one live call per provider), refresh (OpenRouter catalog), "
+             "probe (canary battery), cache-clear")
+    parser.add_argument(
+        "--new-kaggle", metavar="NAME",
+        help="scaffold projects/NAME as a Kaggle campaign (requires "
+             "--competition; see also --metric/--metric-direction)")
+    parser.add_argument(
+        "--competition", metavar="SLUG", default="",
+        help="Kaggle competition slug for --new-kaggle (e.g. titanic)")
+    parser.add_argument(
+        "--metric", metavar="NAME", default="accuracy",
+        help="primary competition metric for --new-kaggle (default: accuracy)")
+    parser.add_argument(
+        "--metric-direction", choices=["maximize", "minimize"],
+        default="maximize", help="metric direction for --new-kaggle")
+    parser.add_argument(
+        "--metric-target", type=float, default=None,
+        help="optional metric target for --new-kaggle")
+    parser.add_argument(
+        "--campaign-status", metavar="PROJECT",
+        help="print the Kaggle campaign state for a scaffolded project")
+    parser.add_argument(
+        "--preflight", metavar="ACTION",
+        choices=["scan", "paths", "scrub"],
+        help="secret hygiene: scan (walk the workspace for credential-shaped "
+             "content before you commit or push), paths (list every file "
+             "redaction considers a live secret), scrub (dry-run remediation of "
+             "shared memory; add --apply to write)")
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="commit the changes --preflight scrub would make; without it "
+             "scrub only reports. Requires --preflight scrub")
+    return parser.parse_args(argv)
+
+
+def _preflight_command(action: str, workspace: Path, apply: bool = False) -> int:
+    """Handle ``--preflight`` actions without taking the orchestrator lock."""
+    import redaction
+
+    if not config.REDACTION_ENABLED and not config.SECRET_SCAN_ENABLED:
+        print("secret hygiene is disabled "
+              "(REDACTION_ENABLED=false, SECRET_SCAN_ENABLED=false)")
+        return 0
+
+    if action == "paths":
+        values = redaction.known_secret_values(workspace, refresh=True)
+        names = sorted(redaction._env_candidates(workspace))
+        print(f"{len(values)} live secret values discovered from "
+              f"{len(names)} credential-shaped variable name(s):")
+        for name in names:
+            print(f"  {name}")
+        print("values are never printed; use --preflight scrub to remove them "
+              "from files")
+        return 0
+
+    if action == "scan":
+        findings = redaction.scan_tree(workspace)
+        if not findings:
+            print("preflight scan: clean, no credential-shaped content found")
+            return 0
+        by_file: Dict[str, List[redaction.Finding]] = {}
+        for finding in findings:
+            by_file.setdefault(str(finding.get("path", "?")), []).append(finding)
+        print(f"preflight scan: {len(findings)} finding(s) in "
+              f"{len(by_file)} file(s)")
+        for path in sorted(by_file):
+            rows = by_file[path]
+            rules = sorted({str(r.get("rule")) for r in rows})
+            hints = sorted({str(r.get("hint")) for r in rows})
+            print(f"  {path}")
+            print(f"      rules={','.join(rules)} hints={','.join(hints[:4])}")
+        print("\nValues are never printed. Confirm every hit is a false "
+              "positive, or remove the secret and re-run.")
+        return 1
+
+    # action == "scrub"
+    targets = [t.strip() for t in
+               str(config.SECRET_SCRUB_TARGETS or "").split(",")
+               if t.strip()]
+    if not targets:
+        print("no SECRET_SCRUB_TARGETS configured", file=sys.stderr)
+        return 2
+
+    total = 0
+    touched: List[str] = []
+    for rel in targets:
+        path = Path(workspace) / rel
+        if not path.exists():
+            print(f"  {rel}: not present, skipped")
+            continue
+        if apply:
+            count, backup, findings = redaction.apply_scrub_json_file(path)
+            if backup is not None:
+                rules = sorted({str(f.get("rule")) for f in findings})
+                print(f"  {rel}: {count} replacement(s) "
+                      f"[{','.join(rules)}] backup={backup.name}")
+        else:
+            count, findings = redaction.scrub_json_file(path)
+            if count:
+                rules = sorted({str(f.get("rule")) for f in findings})
+                print(f"  {rel}: {count} would be replaced "
+                      f"[{','.join(rules)}]  (dry run -- nothing written)")
+        total += count
+        if count:
+            touched.append(rel)
+
+    if not apply:
+        print(f"\nDRY RUN: {total} replacement(s) available across "
+              f"{len(touched)} file(s). Re-run with --apply to write "
+              f"(a timestamped .bak- backup is taken first).")
+        return 1 if total else 0
+
+    log_event("INFO", "secrets_scrub_completed",
+              {"files": len(touched), "replacements": total})
+    print(f"\napplied: {total} replacement(s) across {len(touched)} file(s)")
+    return 1 if total else 0
+
+
+def _models_command(action: str, workspace: Path) -> int:
+    """Handle ``--models`` actions without taking the orchestrator lock."""
+    import llm_cache
+    import model_router
+
+    if action == "refresh":
+        result = model_router.refresh_catalog(workspace_root=workspace)
+        if result.get("ok"):
+            print(f"catalog refreshed: {result.get('count', 0)} free models")
+            return 0
+        print(f"catalog refresh failed: {result.get('error')}", file=sys.stderr)
+        return 1
+    if action == "probe":
+        from agent_roles import LLMClient
+        llm = LLMClient(workspace)
+        results = asyncio.run(model_router.probe_models(
+            llm, workspace_root=workspace))
+        for row in results:
+            print(json.dumps(row, ensure_ascii=False))
+        return 0
+    if action == "verify":
+        from agent_roles import LLMClient
+        llm = LLMClient(workspace)
+        results = asyncio.run(model_router.verify_providers(
+            llm, workspace_root=workspace))
+        for row in results:
+            print(json.dumps(row, ensure_ascii=False))
+        return 0 if results and all(r.get("ok") for r in results) else 1
+    if action == "cache-clear":
+        removed = llm_cache.clear(workspace)
+        print(f"cache cleared: {removed} entries removed")
+        return 0
+    print(json.dumps(model_router.capacity_summary(workspace),
+                     indent=2, ensure_ascii=False))
+    return 0
+
+
+def _author_plan_command(project_dir: Path, goal: str, workspace: Path) -> int:
+    """Author a tests-first breakdown now and print it, without orchestrating.
+
+    This is the readable half of Phase E.  The autonomous path runs on the first
+    orchestration tick; this one exists so the generated specification can be
+    *read* before it is trusted, which is the right way to meet a system that
+    has just started writing its own contract.
+    """
+    import asyncio
+
+    from agent_roles import LLMClient, SpecAuthorAgent
+
+    agent = SpecAuthorAgent(LLMClient(workspace), project_dir, workspace)
+    existing: List[str] = []
+    board_path = project_dir / ".agent" / "task_board.json"
+    try:
+        board = json.loads(board_path.read_text(encoding="utf-8"))
+        existing = [str(t.get("id")) for t in board.get("tasks", [])]
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+
+    context = ""
+    try:
+        context = (project_dir / ".agent" / "context.md").read_text(
+            encoding="utf-8")
+    except OSError:
+        pass
+
+    plan = asyncio.run(agent.run(goal, existing_ids=existing, context=context,
+                                 max_tasks=config.SPEC_AUTHOR_MAX_TASKS))
+    if not plan.usable:
+        print("the author produced no usable tasks:")
+        for note in plan.notes:
+            print(f"  - {note}")
+        for task in plan.rejected:
+            print(f"  - rejected {task.test_path or '(unnamed)'}: {task.rejected}")
+        return 1
+
+    print(f"\n{len(plan.usable)} task(s) across "
+          f"{len(plan.chains())} chain(s):\n")
+    for chain, group in plan.chains().items():
+        print(f"  chain {chain}:")
+        for authored in group:
+            test_path = authored.test_path or "(no test)"
+            print(f"    {authored.task.id}  {authored.task.title}")
+            print(f"       target : "
+                  f"{', '.join(authored.task.target_files or [])}")
+            print(f"       test   : {test_path}")
+    if plan.rejected:
+        print(f"\n{len(plan.rejected)} task(s) rejected:")
+        for task in plan.rejected:
+            print(f"  - {task.test_path or '(unnamed)'}: {task.rejected}")
+    if plan.notes:
+        print("\nnotes:")
+        for note in plan.notes:
+            print(f"  - {note}")
+    print("\nThis plan has NOT been written to the board. Review it, then run "
+          "the\norchestrator to have the system author and build it.")
+    return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = _parse_args(argv)
+    workspace = config.ensure_workspace()  # idempotent bootstrap
+
+    if args.goal and not (args.new_project or args.new_kaggle
+                          or args.campaign_status):
+        # A goal on its own is meaningless: there is no project to attach it to.
+        print("error: --goal requires --new-project (or --new-kaggle)",
+              file=sys.stderr)
+        return 2
+
+    if args.new_project:
+        try:
+            project_dir = config.scaffold_new_project(args.new_project, workspace)
+        except (ValueError, FileExistsError) as exc:
+            print(f"error: {exc}", file=sys.stderr)  # CLI error, not logging
+            return 2
+        board = project_dir / ".agent" / "task_board.json"
+        print(f"scaffolded {project_dir}")  # CLI output, not logging
+        if args.goal:
+            goal_file = project_dir / "goal.txt"
+            goal_file.write_text(args.goal.strip() + "\n", encoding="utf-8")
+            print(f"goal recorded in {goal_file}")
+            if args.author_plan:
+                return _author_plan_command(project_dir, args.goal, workspace)
+            print("next: python main.py --once   "
+                  "(the system will author the board from the goal)")
+            return 0
+        print(f"next: describe tasks in {board} then run: python main.py")
+        return 0
+
+    if args.goal and args.campaign_status:
+        project_dir = workspace / "projects" / args.campaign_status
+        if not project_dir.exists():
+            print(f"error: no such project: {project_dir}", file=sys.stderr)
+            return 2
+        (project_dir / "goal.txt").write_text(args.goal.strip() + "\n",
+                                              encoding="utf-8")
+        print(f"goal recorded in {project_dir / 'goal.txt'}")
+        return 0
+
+    if args.models:
+        return _models_command(args.models, workspace)
+
+    if args.preflight:
+        if args.apply and args.preflight != "scrub":
+            print("error: --apply is only valid with --preflight scrub",
+                  file=sys.stderr)
+            return 2
+        return _preflight_command(args.preflight, workspace, apply=args.apply)
+
+    if args.apply:
+        print("error: --apply requires --preflight scrub", file=sys.stderr)
+        return 2
+
+    if args.new_kaggle:
+        if not args.competition:
+            print("error: --new-kaggle requires --competition SLUG",
+                  file=sys.stderr)
+            return 2
+        from domains import kaggle_pack
+        try:
+            project_dir = kaggle_pack.scaffold(
+                args.new_kaggle, args.competition, args.metric,
+                args.metric_direction, args.metric_target, workspace)
+        except (ValueError, FileExistsError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(f"scaffolded Kaggle campaign {project_dir}")
+        print("next: put competition data in "
+              f"{project_dir / 'data' / 'raw'}, then run: python main.py")
+        return 0
+
+    if args.campaign_status:
+        from domains import kaggle_pack
+        project_dir = workspace / "projects" / args.campaign_status
+        if not project_dir.exists():
+            print(f"error: no such project: {project_dir}", file=sys.stderr)
+            return 2
+        print(json.dumps(kaggle_pack.load_campaign(project_dir),
+                         indent=2, ensure_ascii=False))
+        return 0
+
+    orchestrator = SuperOrchestrator(workspace)
+
+    if args.once:
+        with _orchestrator_lock(workspace):
+            asyncio.run(orchestrator.run(once=True))
+        return 0
+
+    if args.feed:
+        from dashboard import run_feed
+        run_feed()
+        return 0
+
+    if args.cmd:
+        from dashboard import run_command
+        asyncio.run(run_command())
+        return 0
+
+    if args.dashboard:
+        from dashboard import spawn_dashboard_windows
+        with _orchestrator_lock(workspace):
+            spawn_dashboard_windows()  # feed + command consoles on the desktop
+            try:
+                asyncio.run(orchestrator.run())  # headless build loop
+            except KeyboardInterrupt:
+                log_event("INFO", "dashboard_interrupt_stop", {})
+        return 0
+
+    try:
+        with _orchestrator_lock(workspace):
+            asyncio.run(orchestrator.run())
+    except KeyboardInterrupt:
+        log_event("INFO", "keyboard_interrupt_stop", {})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
