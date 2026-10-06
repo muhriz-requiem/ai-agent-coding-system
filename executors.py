@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import config
 import redaction
+import spec_critic
 from logger import log_event
 
 _OUTPUT_TAIL = 1200  # chars of pytest output kept for logs/feedback
@@ -247,6 +248,45 @@ _UNSAFE_REQUIREMENT_RE = re.compile(
     r"(?:^\s*-e\b)|(?:^\s*--editable\b)|(?:git\+)|(?:https?://)|(?:file://)|"
     r"(?:\.whl\b)|(?:\.tar\.gz\b)|(?:^\s*\.)",
     re.IGNORECASE)
+
+
+def partition_missing(modules: Sequence[str], project_root: Path
+                      ) -> Tuple[List[str], List[str]]:
+    """Split missing module names into ``(installable, internal)``.
+
+    A missing module has two completely different causes, and only one of them
+    is a missing dependency:
+
+    * ``pandas`` -- a third-party package. ``pip install -r requirements.txt``
+      is the right and only remedy, and it is what the self-heal does.
+    * ``src.ledger.account`` -- the project's *own* code, under a name that does
+      not exist. Nothing installs it; it is a wrong import path and the remedy
+      is to change the import. Worse, a project with no ``requirements.txt``
+      (true of every standard-library project) makes the self-heal fail with
+      "no requirements.txt" -- a message that points at the environment when the
+      problem is in the source.
+
+    Measured cost of not distinguishing them: the ledgerline build woke the
+    auto-healer 55 times, every one of them for a path inside the project being
+    built, each attempt burning a cycle before failing identically.
+
+    ``is_internal_module`` is the shared predicate, so this classification and
+    the Spec Critic's cannot drift apart -- which is how the two call sites came
+    to disagree in the first place.
+    """
+    installable: List[str] = []
+    internal: List[str] = []
+    for raw in modules or ():
+        name = str(raw or "").strip()
+        if not name:
+            continue
+        try:
+            is_internal = spec_critic.is_internal_module(
+                name, Path(project_root))
+        except Exception:  # noqa: BLE001 -- triage must never break the gate
+            is_internal = False
+        (internal if is_internal else installable).append(name)
+    return installable, internal
 
 
 def run_pip_install(project_root: Path,

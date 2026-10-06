@@ -26,7 +26,7 @@ import pytest
 import config
 import diagnosis
 import spec_critic
-from validation import TaskSpec
+from validation import TaskSpec, validate_or_error
 
 
 # ============================================================ fixture helper
@@ -1054,3 +1054,117 @@ def test_still_catches_a_real_existence_claim():
                if f.kind == "objective_asserts_absent_symbols"]
     assert missing, "a genuine 'already exposes X' claim must still be caught"
     assert "reset_settings_cache" in missing[0].detail
+
+# ============================ Duplicate public symbol across tasks (v2.9.1)
+def test_flags_a_symbol_two_tasks_must_each_define(tmp_path):
+    """The wart that got a delivered library: two ``JournalEntry`` types.
+
+    On the ledgerline board the ``ledger`` task's test asked for
+    ``JournalEntry`` from ``src.ledger.ledger`` while the ``journal`` task had
+    already defined it in ``src.ledger.journal``.  The Builder satisfied the
+    frozen test by *duplicating* the class instead of importing it, and the
+    gate passed -- the gate only knows what the test checks.  The library now
+    has two incompatible ``JournalEntry`` types.
+    """
+    root = Path(tempfile.mkdtemp())
+    (root / "src" / "ledger").mkdir(parents=True)
+    (root / "tests").mkdir()
+    (root / "src" / "ledger" / "journal.py").write_text(
+        "class JournalEntry: pass\n", encoding="utf-8")
+    (root / "src" / "ledger" / "ledger.py").write_text("class Ledger: pass\n",
+                                                        encoding="utf-8")
+    (root / "tests" / "test_journal.py").write_text(
+        "from src.ledger.journal import JournalEntry\n\n\n"
+        "def test_e():\n    assert JournalEntry\n", encoding="utf-8")
+    (root / "tests" / "test_ledger.py").write_text(
+        "from src.ledger.ledger import Ledger, JournalEntry\n\n\n"
+        "def test_e():\n    assert Ledger and JournalEntry\n",
+        encoding="utf-8")
+    board = [
+        {"id": "T-3", "title": "journal", "objective": "Implement JournalEntry.",
+         "target_files": ["src/ledger/journal.py"],
+         "dependencies": [], "acceptance_criteria": []},
+        {"id": "T-4", "title": "ledger", "objective": "Implement Ledger.",
+         "target_files": ["src/ledger/ledger.py"],
+         "dependencies": [], "acceptance_criteria": []},
+    ]
+    (root / ".agent").mkdir()
+    (root / ".agent" / "task_board.json").write_text(
+        json.dumps({"tasks": board}), encoding="utf-8")
+
+    for raw in board:
+        task, err = validate_or_error(TaskSpec, raw)
+        assert err is None, err
+        found = spec_critic.deterministic_checks(task, root).findings
+        hits = [f for f in found if f.kind == "duplicate_public_symbol"]
+        assert hits, f"{raw['id']} should be told the symbol is contested"
+        assert "JournalEntry" in hits[0].detail
+
+
+def test_a_name_re_exported_from_a_package_is_not_a_duplicate(tmp_path):
+    """Re-exporting is the opposite of duplicating.
+
+    One test importing ``main`` from ``src.pkg.cli`` and another from
+    ``src.pkg`` is the normal shape of a package facade, and the real ledgerline
+    board does exactly that.  Flagging it would be the check crying wolf.
+    """
+    root = Path(tempfile.mkdtemp())
+    (root / "src" / "pkg").mkdir(parents=True)
+    (root / "tests").mkdir()
+    (root / "src" / "pkg" / "cli.py").write_text("def main(): return 0\n",
+                                                 encoding="utf-8")
+    (root / "tests" / "test_cli.py").write_text(
+        "from src.pkg.cli import main\n\n\ndef test_e():\n    assert main\n",
+        encoding="utf-8")
+    (root / "tests" / "test_pkg.py").write_text(
+        "import src.pkg\n\n\ndef test_e():\n    assert src.pkg.main is not None\n",
+        encoding="utf-8")
+    board = [
+        {"id": "T-1", "title": "cli", "objective": "Implement the CLI.",
+         "target_files": ["src/pkg/cli.py"], "dependencies": [],
+         "acceptance_criteria": []},
+    ]
+    (root / ".agent").mkdir()
+    (root / ".agent" / "task_board.json").write_text(
+        json.dumps({"tasks": board}), encoding="utf-8")
+    task, err = validate_or_error(TaskSpec, board[0])
+    assert err is None, err
+    # test_pkg imports the package, not a name from a module, so there is
+    # nothing to contest here.
+    assert not [f for f in spec_critic.deterministic_checks(task, root).findings
+                if f.kind == "duplicate_public_symbol"]
+
+
+def test_duplicate_symbol_is_reported_not_blocking():
+    """Same calibration as the other structural findings: real, not fatal."""
+    f = spec_critic.SpecFinding(kind="duplicate_public_symbol", detail="x",
+                                severity="medium")
+    report = spec_critic.SpecReport(task_id="T-1")
+    report.findings.append(f)
+    assert report.blocking == []
+    assert not f.remedy, ("no allow-listed remedy fits this yet, so it must "
+                          "not be advertised as automatically fixable")
+
+
+def test_duplicate_symbol_is_silent_on_the_reference_board():
+    """20 delivered tasks must not accumulate findings from a new check."""
+    import glob
+    root = Path(__file__).resolve().parents[1]
+    boards = sorted(glob.glob(str(root / "projects" / "*" / ".agent" /
+                                 "task_board.json")))
+    assert boards, "no boards found"
+    hits = []
+    for path in boards:
+        project = Path(path).parents[1]
+        for raw in json.loads(Path(path).read_text(
+                encoding="utf-8")).get("tasks", []):
+            task, err = validate_or_error(TaskSpec, raw)
+            if err:
+                continue
+            found = [f for f in spec_critic.deterministic_checks(task, project).findings
+                     if f.kind == "duplicate_public_symbol"]
+            if found:
+                hits.append(f"{project.name}/{raw.get('id')}")
+    # ledgerline is the known-bad board this check exists to describe; every
+    # other board must be silent.
+    assert set(hits) <= {"ledgerline/T-003", "ledgerline/T-004"}, hits

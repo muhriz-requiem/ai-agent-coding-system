@@ -34,10 +34,12 @@ or orchestration paths that call it.
 
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -52,7 +54,9 @@ __all__ = [
     "reset_cache",
     "scan_secrets",
     "scan_path",
+    "scan_paths",
     "scan_tree",
+    "tracked_files",
     "scrub_secrets",
     "scrub_json_file",
     "apply_scrub_json_file",
@@ -526,6 +530,104 @@ def scan_path(path: Any, max_bytes: int = 4 * 1024 * 1024) -> List[Finding]:
     for finding in findings:
         finding["path"] = str(target)
     return findings
+
+
+def scan_paths(paths: Sequence[Any], max_bytes: int = 4 * 1024 * 1024
+               ) -> List[Finding]:
+    """Scan an explicit list of files, in order, skipping unreadable ones.
+
+    Separate from :func:`scan_tree` on purpose.  ``scan_tree`` answers "is there
+    credential-shaped content anywhere in this tree", which is the right
+    question for a *working directory* and the wrong one for a *repository*:
+    it is always red, because a live ``.env`` and the secret-scanner test
+    fixtures both match, and a check that can never pass is a check nobody
+    reads.  This takes the caller's list, so a caller can scope the question to
+    what could actually be committed.
+    """
+    findings: List[Finding] = []
+    for raw in paths or ():
+        try:
+            candidate = Path(raw)
+        except TypeError:
+            continue
+        if not candidate.is_file():
+            continue
+        findings.extend(scan_path(candidate, max_bytes=max_bytes))
+    return findings
+
+
+def scan_allowlist(root: Any) -> List[str]:
+    """Patterns in ``<root>/.secret-scan-allow`` -- files allowed to hold secrets.
+
+    A secret scanner needs a way to say "this file is *supposed* to contain
+    credential-shaped text".  Without one, the check is permanently red and
+    therefore permanently ignored: this repo's own scanner fixtures are 38
+    synthetic matches across five files, all of them necessary, so
+    ``--preflight scan`` could never pass and taught the operator to skim past
+    it.  A red check is not a safe check.
+
+    Deliberately narrow, and only honoured by the ``--committed`` scope:
+
+    * it lists **paths**, never values, so the allowlist cannot itself become a
+      place secrets are stored;
+    * it is itself tracked, so every exemption is reviewable in a diff;
+    * it is ignored by the whole-tree scan, which still reports everything --
+      suppressing a finding in a committed file must not silence the wider
+      sweep.
+
+    Patterns are matched with :func:`fnmatch.fnmatch` against the
+    repo-relative POSIX path, so ``tests/test_redaction.py`` and
+    ``tests/test_*_gates.py`` both work.
+    """
+    path = Path(root) / ".secret-scan-allow"
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: List[str] = []
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            out.append(line.replace("\\", "/"))
+    return out
+
+
+def is_scan_allowed(rel_path: Any, patterns: Sequence[str]) -> bool:
+    """True when *rel_path* matches an allowlist pattern."""
+    rel = Path(rel_path).as_posix()
+    return any(fnmatch.fnmatch(rel, pat) for pat in patterns or ())
+
+
+def tracked_files(root: Any) -> Tuple[List[Path], str]:
+    """``(paths, note)`` for the files git currently tracks under *root*.
+
+    ``git ls-files -z`` is the only authoritative answer to "what could a commit
+    pick up", which is strictly better than re-implementing ``.gitignore``
+    parsing (and cannot drift from git's own semantics).  When git is missing or
+    the directory is not a repository the caller must be told, because a scan
+    that silently degrades to "everything" would report a green result while
+    having checked nothing -- the exact failure mode this mode exists to remove.
+    """
+    base = Path(root)
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(base), "ls-files", "-z"],
+            capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [], f"git unavailable ({exc}); cannot determine tracked files"
+    if proc.returncode != 0:
+        return [], (f"not a git repository (git ls-files exited "
+                    f"{proc.returncode}); cannot determine tracked files")
+    out: List[Path] = []
+    for entry in proc.stdout.split(b"\0"):
+        if not entry:
+            continue
+        rel = entry.decode("utf-8", errors="replace")
+        candidate = base / rel
+        if candidate.is_file():
+            out.append(candidate)
+    return out, (f"{len(out)} tracked file(s)" if out
+                 else "repository tracks no files")
 
 
 def scan_tree(root: Any, include: Optional[Sequence[str]] = None,

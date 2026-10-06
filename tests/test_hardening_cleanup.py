@@ -2,7 +2,6 @@
 
 import pytest
 
-import config
 import executors
 
 

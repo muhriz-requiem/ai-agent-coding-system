@@ -166,7 +166,6 @@ def _campaign_scaffold(tmp_path, name="camp"):
 
 def test_campaign_director_agent_with_fake_llm(tmp_path):
     from agent_roles import CampaignDirectorAgent
-    from agent_roles import LLMClient
 
     class FakeLLM:
         async def complete(self, system, user, tools=None, model_role=None):

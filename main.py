@@ -15,7 +15,7 @@ import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional
 
 import config
 import providers
@@ -171,10 +171,46 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--apply", action="store_true",
         help="commit the changes --preflight scrub would make; without it "
              "scrub only reports. Requires --preflight scrub")
+    parser.add_argument(
+        "--committed", action="store_true",
+        help="with --preflight scan: check only the files git tracks, i.e. "
+             "what a commit could actually pick up. The whole-tree scan is "
+             "always red (a live .env, and the secret-scanner test fixtures, "
+             "match by design); this answers the question you actually have "
+             "before a push. Exits 2 rather than scanning everything when git "
+             "cannot tell us what is tracked.")
     return parser.parse_args(argv)
 
 
-def _preflight_command(action: str, workspace: Path, apply: bool = False) -> int:
+def _report_scan(findings: List[Dict[str, Any]], scope: str) -> int:
+    """Print a scan result and return the process exit code.
+
+    Values are never printed, only rule names and sha256 hints, so this is safe
+    to run on a shared screen.  The findings are typed loosely because
+    ``redaction`` is imported locally (see :func:`_preflight_command`) and a
+    module-level annotation would need the import moved to startup.
+    """
+    if not findings:
+        print(f"preflight scan: clean, no credential-shaped content in {scope}")
+        return 0
+    by_file: Dict[str, List[Dict[str, Any]]] = {}
+    for finding in findings:
+        by_file.setdefault(str(finding.get("path", "?")), []).append(finding)
+    print(f"preflight scan: {len(findings)} finding(s) in "
+          f"{len(by_file)} file(s) [{scope}]")
+    for path in sorted(by_file):
+        rows = by_file[path]
+        rules = sorted({str(r.get("rule")) for r in rows})
+        hints = sorted({str(r.get("hint")) for r in rows})
+        print(f"  {path}")
+        print(f"      rules={','.join(rules)} hints={','.join(hints[:4])}")
+    print("\nValues are never printed. Confirm every hit is a false "
+          "positive, or remove the secret and re-run.")
+    return 1
+
+
+def _preflight_command(action: str, workspace: Path, apply: bool = False,
+                       committed: bool = False) -> int:
     """Handle ``--preflight`` actions without taking the orchestrator lock."""
     import redaction
 
@@ -195,24 +231,49 @@ def _preflight_command(action: str, workspace: Path, apply: bool = False) -> int
         return 0
 
     if action == "scan":
-        findings = redaction.scan_tree(workspace)
-        if not findings:
-            print("preflight scan: clean, no credential-shaped content found")
-            return 0
-        by_file: Dict[str, List[redaction.Finding]] = {}
-        for finding in findings:
-            by_file.setdefault(str(finding.get("path", "?")), []).append(finding)
-        print(f"preflight scan: {len(findings)} finding(s) in "
-              f"{len(by_file)} file(s)")
-        for path in sorted(by_file):
-            rows = by_file[path]
-            rules = sorted({str(r.get("rule")) for r in rows})
-            hints = sorted({str(r.get("hint")) for r in rows})
-            print(f"  {path}")
-            print(f"      rules={','.join(rules)} hints={','.join(hints[:4])}")
-        print("\nValues are never printed. Confirm every hit is a false "
-              "positive, or remove the secret and re-run.")
-        return 1
+        if committed:
+            # v2.9.1: the question that actually matters before a push is "could
+            # a secret reach a commit", not "does one exist anywhere here".  The
+            # full-tree scan can never pass -- a live .env and the
+            # secret-scanner test fixtures both match by design -- and a check
+            # that is always red is a check nobody reads.
+            paths, note = redaction.tracked_files(workspace)
+            if not paths:
+                # Never degrade silently: a fallback to "scan everything" would
+                # report on a scope the caller did not ask for.
+                print(f"preflight scan --committed: {note}", file=sys.stderr)
+                print("Nothing was scanned. Initialise git and commit, or "
+                      "drop --committed to scan the whole tree.",
+                      file=sys.stderr)
+                return 2
+            allowed = redaction.scan_allowlist(workspace)
+            findings = redaction.scan_paths(paths)
+            suppressed: List[str] = []
+            if allowed:
+                keep: List[Dict[str, Any]] = []
+                for finding in findings:
+                    hit = str(finding.get("path", ""))
+                    try:
+                        rel = str(Path(hit).resolve().relative_to(
+                            Path(workspace).resolve()).as_posix())
+                    except (ValueError, OSError):
+                        rel = hit
+                    if redaction.is_scan_allowed(rel, allowed):
+                        if rel not in suppressed:
+                            suppressed.append(rel)
+                    else:
+                        keep.append(finding)
+                findings = keep
+            code = _report_scan(findings, scope=note)
+            if suppressed:
+                # Never silent about an exemption: the count and the paths are
+                # part of the answer.
+                print(f"\n{len(suppressed)} file(s) exempt under "
+                      f".secret-scan-allow ({len(allowed)} pattern(s)): "
+                      + ", ".join(suppressed[:8]))
+            return code
+        return _report_scan(redaction.scan_tree(workspace),
+                            scope="whole tree")
 
     # action == "scrub"
     targets = [t.strip() for t in
@@ -404,10 +465,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("error: --apply is only valid with --preflight scrub",
                   file=sys.stderr)
             return 2
-        return _preflight_command(args.preflight, workspace, apply=args.apply)
+        if args.committed and args.preflight != "scan":
+            print("error: --committed is only valid with --preflight scan",
+                  file=sys.stderr)
+            return 2
+        return _preflight_command(args.preflight, workspace, apply=args.apply,
+                                  committed=args.committed)
 
     if args.apply:
         print("error: --apply requires --preflight scrub", file=sys.stderr)
+        return 2
+
+    if args.committed:
+        print("error: --committed requires --preflight scan", file=sys.stderr)
         return 2
 
     if args.new_kaggle:

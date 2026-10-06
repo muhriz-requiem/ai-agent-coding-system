@@ -31,7 +31,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
-from validation import TaskSpec, board_keys_for, is_executable_remedy
+from validation import (TaskSpec, board_keys_for, is_executable_remedy,
+                         validate_or_error)
 
 #: Severity at or above which a task is not scheduled.  Lower severities are
 #: annotated onto the objective and the build proceeds, because a Critic that
@@ -428,6 +429,19 @@ def _unresolvable_internal_imports(test_file: Path, project_root: Path,
         seen.add(dotted)
         problems.append(_internal_import_problem(dotted, root))
     return problems
+
+
+def is_internal_module(dotted: str, project_root: Path) -> bool:
+    """Public form of :func:`_looks_internal`.
+
+    Exists because the distinction is needed in two places that are easy to let
+    drift apart: the Critic (which reports a wrong in-project import path as a
+    spec defect) and the environment self-heal (which must *not* try to
+    ``pip install`` one).  Sharing the predicate is the point -- the auto-heal
+    bug existed precisely because the Critic had the distinction and the
+    auto-heal did not.
+    """
+    return _looks_internal(dotted, project_root)
 
 
 def nearest_project_module(dotted: str, project_root: Path) -> str:
@@ -1028,13 +1042,18 @@ def project_structure_findings(task: TaskSpec,
             f"is the strongest predictor of first-try completion in this system",
             severity="medium", remedy="split_task"))
 
-    board = _load_board(project_root)
+    board = load_board(project_root)
     if board is None or not impl_targets:
         return findings
-    others = [t for t in (board.get("tasks") or [])
-              if isinstance(t, dict) and str(t.get("id")) != task.id]
+    board_tasks = [t for t in (board.get("tasks") or [])
+                   if isinstance(t, dict) and str(t.get("id")) != task.id]
+    others = board_tasks
     if not others:
         return findings
+
+    for finding in _duplicate_symbol_findings(task, Path(project_root),
+                                                  board.get("tasks") or []):
+        findings.append(finding)
 
     owned = {str(t.get("id")) for t in others
              if str(t.get("id")) in (task.dependencies or [])}
@@ -1099,7 +1118,92 @@ def project_structure_findings(task: TaskSpec,
     return findings
 
 
-def _load_board(project_root: Path) -> Optional[Dict[str, Any]]:
+def _board_test_imports(board_tasks: Sequence[Dict[str, Any]],
+                        root: Path) -> Dict[str, List[Tuple[str, str]]]:
+    """``symbol -> [(task_id, module), ...]`` demanded by the board's tests.
+
+    Reads the *tests*, not the objectives, because the tests are the contract:
+    if two test files each ask a different module for the same name, then two
+    implementations have to define it independently, and the second will drift
+    from the first.
+
+    Test paths come from :func:`_test_files_for`, not from ``target_files`` --
+    under tests-first an authored task deliberately declares only its
+    *implementation* file (the test is the frozen contract, written before the
+    task exists), so looking in ``target_files`` finds nothing at all.  That was
+    the first version, and it silently detected zero.
+    """
+    wanted: Dict[str, List[Tuple[str, str]]] = {}
+    for raw in board_tasks:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            spec, err = validate_or_error(TaskSpec, raw)
+        except Exception:  # noqa: BLE001 -- a malformed entry is not evidence
+            continue
+        if err or spec is None:
+            continue
+        task_id = str(raw.get("id"))
+        for path in _test_files_for(spec, root):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8",
+                                                errors="replace"))
+            except (OSError, SyntaxError):
+                continue
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom) or node.level:
+                    continue
+                module = node.module or ""
+                if not module or not _looks_internal(module, root):
+                    continue
+                for alias in node.names:
+                    if alias.name == "*":
+                        continue
+                    wanted.setdefault(alias.name, []).append((task_id, module))
+    return wanted
+
+
+def _duplicate_symbol_findings(task: TaskSpec, root: Path,
+                               board_tasks: Sequence[Dict[str, Any]]
+                               ) -> List[SpecFinding]:
+    """Two tasks asked to define the same public name.
+
+    The failure this prevents, observed on a real authored board: the
+    ``ledger`` task's test asked for ``JournalEntry`` from ``src.ledger.ledger``
+    while the ``journal`` task had already defined it in
+    ``src.ledger.journal``.  The Builder satisfied the frozen test by
+    *duplicating* the class rather than importing it, the gate passed -- the
+    gate only knows what the test checks -- and the delivered library has two
+    incompatible ``JournalEntry`` types.
+
+    ``__init__`` modules are excluded because re-exporting a name is the
+    opposite of duplicating it, which is what makes ``from src.pkg import main``
+    in one test and ``from src.pkg.cli import main`` in another legitimate.
+    """
+    wanted = _board_test_imports(board_tasks, root)
+    mine = {str(t.get("id")) for t in board_tasks
+            if isinstance(t, dict) and str(t.get("id")) == task.id}
+    findings: List[SpecFinding] = []
+    for symbol, sources in sorted(wanted.items()):
+        mine_here = {m for tid, m in sources if tid in mine}
+        others = {m for tid, m in sources if tid not in mine}
+        # A package's __init__ is a re-export surface, not a definition site.
+        mine_here = {m for m in mine_here if not m.endswith(".__init__")}
+        others = {m for m in others if not m.endswith(".__init__")}
+        clash = {m for m in mine_here if m not in others}
+        if clash and others:
+            findings.append(SpecFinding(
+                "duplicate_public_symbol",
+                f"{symbol!r} is demanded by this task's test from "
+                f"{', '.join(sorted(mine_here))} and by another task's test "
+                f"from {', '.join(sorted(others))}; both modules would have to "
+                f"define it independently and the copies will drift. One task "
+                f"must own it and the other must import it.",
+                severity="medium"))
+    return findings
+
+
+def load_board(project_root: Path) -> Optional[Dict[str, Any]]:
     """The project's board, or None when absent/unreadable."""
     path = Path(project_root) / ".agent" / "task_board.json"
     try:

@@ -341,6 +341,57 @@ class ProjectOrchestrator:
                            "notes": len(report.findings)})
         return chosen, raw
 
+    async def _maybe_autoheal(self, task: TaskSpec,
+                              modules: Sequence[str]) -> bool:
+        """Self-heal the environment, but only for genuinely missing packages.
+
+        Returns True when an install was attempted and succeeded, so the caller
+        knows whether re-running its gate is worthwhile.
+
+        v2.9.1 -- this used to fire on *any* missing module.  The distinction
+        that matters is not spelled anywhere in the code: a missing
+        ``pandas`` is a dependency problem that ``pip install -r
+        requirements.txt`` fixes, and a missing ``src.ledger.account`` is the
+        project's own code under a name that does not exist, which no install
+        can fix and which no ``requirements.txt`` can even mention.  Measured on
+        the ledgerline build: the healer woke 55 times, every one for a path
+        *inside the project it was building*, and a standard-library project
+        with no ``requirements.txt`` made every one of them fail identically --
+        burning a cycle per attempt to report an environment problem that was
+        actually a wrong import.
+
+        Internal paths are now reported as what they are, under their own event,
+        so the operator and the Builder's feedback both see the real cause.
+        """
+        if not modules or not config.ENV_AUTOHEAL_ENABLED or self._env_heal_done:
+            return False
+        installable, internal = executors.partition_missing(
+            modules, self.project_root)
+        if internal:
+            log_event("WARNING", "env_autoheal_skipped_internal",
+                      {"project": self.project_name, "task_id": task.id,
+                       "internal_modules": internal[:6],
+                       "note": "these resolve into this project's own "
+                               "namespace, so they are wrong import paths, "
+                               "not missing dependencies; nothing to install"})
+        if not installable:
+            return False
+        self._env_heal_done = True
+        log_event("INFO", "env_autoheal_started",
+                  {"project": self.project_name, "task_id": task.id,
+                   "missing_modules": installable[:8]})
+        heal = await asyncio.to_thread(executors.run_pip_install,
+                                       self.project_root)
+        if heal["ok"]:
+            log_event("INFO", "env_autoheal_completed",
+                      {"project": self.project_name, "task_id": task.id})
+            return True
+        log_event("WARNING", "env_autoheal_failed",
+                  {"project": self.project_name, "task_id": task.id,
+                   "missing_modules": installable[:8],
+                   "detail": heal["detail"][:200]})
+        return False
+
     def _deterministic_spec_report(self, task: TaskSpec) -> Optional[Any]:
         """The free tier of the Spec Critic. Never raises."""
         try:
@@ -649,23 +700,10 @@ class ProjectOrchestrator:
 
         # v2.5.6 environment self-heal: missing imports -> install the
         # project's own requirements once per task, then re-run the gate
-        # with the files still applied.  Requirements-only policy.
-        if tests.get("missing_modules") and config.ENV_AUTOHEAL_ENABLED \
-                and not self._env_heal_done:
-            self._env_heal_done = True
-            log_event("INFO", "env_autoheal_started",
-                      {"project": self.project_name, "task_id": task.id,
-                       "missing_modules": tests["missing_modules"]})
-            heal = await asyncio.to_thread(executors.run_pip_install,
-                                           self.project_root)
-            if heal["ok"]:
-                log_event("INFO", "env_autoheal_completed",
-                          {"project": self.project_name, "task_id": task.id})
-                tests = executors.run_tests(self.project_root)
-            else:
-                log_event("WARNING", "env_autoheal_failed",
-                          {"project": self.project_name, "task_id": task.id,
-                           "detail": heal["detail"][:200]})
+        # with the files still applied.  Requirements-only policy, and (since
+        # v2.9.1) only for modules that are actually installable.
+        if await self._maybe_autoheal(task, tests.get("missing_modules") or ()):
+            tests = executors.run_tests(self.project_root)
 
         out["tests"] = {"passed": tests["passed"], "failed": tests["failed"],
                         "skipped": tests.get("skipped", 0),
@@ -760,26 +798,13 @@ class ProjectOrchestrator:
             required_fields=(metric.required_fields if metric else None))
 
         # Same environment self-heal as the pytest gate (once per task).
-        if objective.get("missing_modules") and config.ENV_AUTOHEAL_ENABLED \
-                and not self._env_heal_done:
-            self._env_heal_done = True
-            log_event("INFO", "env_autoheal_started",
-                      {"project": self.project_name, "task_id": task.id,
-                       "missing_modules": objective["missing_modules"]})
-            heal = await asyncio.to_thread(executors.run_pip_install,
-                                           self.project_root)
-            if heal["ok"]:
-                log_event("INFO", "env_autoheal_completed",
-                          {"project": self.project_name, "task_id": task.id})
-                objective = executors.run_objective(
-                    self.project_root, task.run_command or "",
-                    results_path=task.results_path,
-                    timeout=task.max_runtime_s,
-                    required_fields=(metric.required_fields if metric else None))
-            else:
-                log_event("WARNING", "env_autoheal_failed",
-                          {"project": self.project_name, "task_id": task.id,
-                           "detail": heal["detail"][:200]})
+        if await self._maybe_autoheal(
+                task, objective.get("missing_modules") or ()):
+            objective = executors.run_objective(
+                self.project_root, task.run_command or "",
+                results_path=task.results_path,
+                timeout=task.max_runtime_s,
+                required_fields=(metric.required_fields if metric else None))
 
         objective["primary"] = _primary_value(
             objective.get("metrics") or {},
