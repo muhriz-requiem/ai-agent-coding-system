@@ -20,7 +20,7 @@ import os
 import re
 import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -297,6 +297,23 @@ def _models_from_generic_list(pdef: ProviderDef,
             tools=True,
             coding_index=None,
             free=pdef.key in MODELS_ENDPOINT_PROVIDERS,
+            # v2.9.1: mark the capability fields as UNKNOWN rather than False.
+            # These endpoints report an id and little else, so "no structured
+            # output" was never a fact about the model -- it was missing data
+            # wearing a False. And the gate believed it: `_capability_ok`
+            # requires `structured_outputs or response_format` for every JSON
+            # role, so a refresh eliminated the entire provider from the
+            # planner, reviewer, spec_author, spec_critic and diagnosis pools.
+            #
+            # Observed after one `--models refresh`: OpenRouter contributed
+            # 466 discovered models to the roster and **zero** to any JSON role;
+            # the spec_author pool collapsed to the 3 cloudflare models that
+            # still carried hand-typed flags, and the author gave up with
+            # "all free candidates exhausted". The flags are also advisory only --
+            # nothing ever sends `response_format` as a request parameter
+            # (checked: zero call sites), so hard-failing on one eliminated
+            # providers over a preference the code does not use.
+            notes="discovered-capabilities-unverified",
         ))
     models.sort(key=lambda m: m.model)
     return models
@@ -421,15 +438,70 @@ def _openrouter_models(workspace_root: Optional[Path] = None) -> List[ProviderMo
     return [m for m in providers.OPENROUTER_MODELS]
 
 
+def _merge_models(seeds: Sequence[ProviderModel],
+                  discovered: Sequence[ProviderModel]) -> List[ProviderModel]:
+    """Hand-written seeds with discovery *added*, not substituted for.
+
+    v2.9.1.  ``_models_for`` returned the persisted live list whenever one
+    existed, so a single ``--models refresh`` silently replaced every hand-typed
+    seed.  That is the opposite of what ``refresh_catalog`` promises in its own
+    comment -- "removals are reported, never auto-applied to the seeds, that
+    stays an operator decision" -- because the registry *is* what gets read.
+
+    The cost was concrete.  A bare ``/models`` listing carries no capability
+    annotations, so the refreshed roster was 630 unannotated models scoring a
+    flat prior, and the annotated ones were gone: the spec_author pool became
+    five Gemini *preview* models that the same account answers ``400 Developer
+    instruction is not enabled`` for, and the author gave up with "all free
+    candidates exhausted".  The verified model that had been working all session
+    was no longer in the pool at all.
+
+    So: seeds keep their annotations and their identity, discovery contributes
+    everything new, and a discovered entry may only fill a capability field a
+    seed left unset.  A seed the provider has genuinely dropped still stays
+    visible -- if it has also gone away, the health registry and
+    :func:`mark_model_unavailable` retire it on evidence, which is the mechanism
+    that is actually allowed to make that call.
+    """
+    merged: Dict[str, ProviderModel] = {}
+    for seed in seeds:
+        merged[seed.model] = seed
+    for fresh in discovered:
+        existing = merged.get(fresh.model)
+        if existing is None:
+            merged[fresh.model] = fresh
+            continue
+        # Fill only what the seed left unknown; never overwrite a typed value.
+        updates: Dict[str, Any] = {}
+        if existing.coding_index is None and fresh.coding_index is not None:
+            updates["coding_index"] = fresh.coding_index
+        if not existing.structured_outputs and fresh.structured_outputs:
+            updates["structured_outputs"] = True
+        if not existing.response_format and fresh.response_format:
+            updates["response_format"] = True
+        if (existing.context_length or 0) < config.MODEL_MIN_CONTEXT \
+                and (fresh.context_length or 0) > (existing.context_length or 0):
+            updates["context_length"] = fresh.context_length
+        if updates:
+            merged[fresh.model] = replace(existing, **updates)
+    return sorted(merged.values(), key=lambda m: m.model)
+
+
 def _models_for(pdef: ProviderDef,
                 workspace_root: Optional[Path] = None) -> List[ProviderModel]:
-    """Live-discovered models when available, else the hand-written seeds."""
+    """Hand-written seeds *plus* discovery -- see :func:`_merge_models`.
+
+    Merging rather than substituting is the whole point: discovery adds
+    candidates, it does not erase the annotations (and therefore the rankings)
+    that were hand-verified.
+    """
+    seeds = list(pdef.models)
     if pdef.key == "openrouter":
-        return _openrouter_models(workspace_root)
+        return _merge_models(seeds, _openrouter_models(workspace_root))
     discovered = _persisted_models(pdef, workspace_root)
     if discovered:
-        return discovered
-    return list(pdef.models)
+        return _merge_models(seeds, discovered)
+    return seeds
 
 
 # ---------------------------------------------------------------------------
@@ -826,18 +898,68 @@ class Candidate:
     evidence: str = "asserted"
 
 
+#: Marker written by :func:`_models_from_generic_list` on models whose
+#: capability fields are unknown rather than known-false.
+UNVERIFIED_NOTE = "discovered-capabilities-unverified"
+
+
+#: Below this many candidates, and only when relaxing would at least multiply
+#: the pool by this much, the capability filter is treated as over-tight.
+_MIN_POOL_BEFORE_RELAX = 3
+_RELAX_MULTIPLIER = 2
+
+
+def kind_needs_structured(role_key: str) -> bool:
+    """True for role kinds whose eligibility depends on a capability flag."""
+    return _role_kind(role_key) in ("json", "file_bearing")
+
+
+def _capabilities_unverified(model: ProviderModel) -> bool:
+    """True when this model's capability flags are missing data, not verdicts.
+
+    A model discovered from a bare ``/models`` listing carries
+    ``structured_outputs=False`` because the endpoint said nothing about it.
+    Treating that as "cannot do JSON" removes the model from every structured
+    role, which is how one ``--models refresh`` emptied the spec_author pool
+    (466 OpenRouter models discovered, zero eligible). The flag is advisory
+    anyway -- nothing sends ``response_format`` as a request parameter -- so the
+    honest treatment is to admit the model with a lower score, not to exclude it.
+
+    Two signals, because the marker only exists after a refresh:
+
+    * the explicit ``notes`` marker written by
+      :func:`_models_from_generic_list`; and
+    * **no** ``coding_index``. Every hand-verified seed carries a typed
+      capability number, so its absence means "never annotated" -- which is what
+      the capability score already treats as a flat prior. Keying on this means
+      a registry written *before* this fix is still handled correctly, rather
+      than requiring the operator to refresh again.
+    """
+    if UNVERIFIED_NOTE in (model.notes or ""):
+        return True
+    return model.coding_index is None
+
+
 def _capability_ok(role_key: str, pdef: ProviderDef, model: ProviderModel) -> bool:
     kind = _role_kind(role_key)
     if model.context_length < config.MODEL_MIN_CONTEXT:
         return False
+    unverified = _capabilities_unverified(model)
     if kind == "file_bearing":
         # Emits complete files inline, so the floor is per-plan, not per-reply.
         if model.max_output < config.MODEL_FILE_BEARING_MIN_MAX_OUTPUT:
             return False
+        # An unverified model is admitted: it may well emit JSON, and there is
+        # no evidence either way. The rank falls out of `_capability_score`,
+        # where a missing `coding_index` already scores a flat prior.
+        if unverified:
+            return True
         if not (model.structured_outputs or model.response_format):
             return False
         return True
     if kind == "json":
+        if unverified:
+            return True
         if not (model.structured_outputs or model.response_format):
             return False
         return model.max_output >= config.MODEL_MIN_MAX_OUTPUT
@@ -961,7 +1083,60 @@ def rank_candidates(role_key: str, task_type: Optional[str] = None,
             out.append(Candidate(pdef=pdef, model=model, score=round(score, 4),
                                  evidence=_evidence_label(entry)))
     out.sort(key=lambda c: (-c.score, c.pdef.priority, c.model.model))
-    return out[:max(0, top_k)]
+    ranked = out[:max(0, top_k)]
+
+    # Safety net.  Every filter above can legitimately empty the pool -- a
+    # provider quota exhausted, an over-tight capability floor, a refreshed
+    # roster that lost its annotations.  A pool of one provider with no
+    # redundancy is the worst outcome, because a single provider's bad minute
+    # then fails every call for that role with "all free candidates exhausted",
+    # which is exactly how the slatepress author gave up.
+    #
+    # So: if capability filtering left a small pool and a *less* filtered one
+    # would be materially larger, fall back and say so.  The same principle as
+    # `--preflight scan --committed` refusing to degrade silently.
+    if len(ranked) < _MIN_POOL_BEFORE_RELAX and kind_needs_structured(role_key):
+        relaxed: List[Candidate] = []
+        for pdef in providers.enabled_providers():
+            for model in _models_for(pdef, workspace_root):
+                if model.model in excluded:
+                    continue
+                key = f"{pdef.key}|{model.model}"
+                if key in dead or key in gone:
+                    continue
+                if governor.cooldown_active(pdef.key, model.model):
+                    continue
+                if _role_kind(role_key) == "file_bearing" and \
+                        model.max_output < \
+                        config.MODEL_FILE_BEARING_MIN_MAX_OUTPUT:
+                    continue
+                if model.context_length < config.MODEL_MIN_CONTEXT:
+                    continue
+                entry = entries.get(f"{pdef.key}|{model.model}|{role_key}") or {}
+                utilization = governor.utilization(pdef)
+                headroom = 0.5 if utilization < 0 else max(
+                    0.0, 1.0 - utilization)
+                priority = max(0.0, min(1.0, (100.0 - pdef.priority) / 100.0))
+                score = (CAPABILITY_WEIGHT * _capability_score(role_key, model)
+                         + HEALTH_WEIGHT * _health_score(entry)
+                         + HEADROOM_WEIGHT * headroom
+                         + PRIORITY_WEIGHT * priority)
+                relaxed.append(Candidate(pdef=pdef, model=model,
+                                         score=round(score, 4),
+                                         evidence=_evidence_label(entry)))
+        if len(relaxed) > len(ranked) * _RELAX_MULTIPLIER:
+            relaxed.sort(key=lambda c: (-c.score, c.pdef.priority,
+                                        c.model.model))
+            log_event("WARNING", "capability_pool_relaxed",
+                      {"role": role_key,
+                       "filtered": len(ranked),
+                       "relaxed": len(relaxed),
+                       "kept": min(len(relaxed), max(0, top_k)),
+                       "note": "structured-output filtering left too small a "
+                               "pool; admitted models whose capability flags "
+                               "are unknown rather than verified false"})
+            return relaxed[:max(0, top_k)]
+    return ranked
 
 
 def models_used_for(project_tasks: str = "") -> Dict[str, List[str]]:

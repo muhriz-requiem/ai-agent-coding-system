@@ -1010,6 +1010,86 @@ def _impl_targets(task: TaskSpec) -> List[str]:
     return out
 
 
+def _unowned_package_imports(task: TaskSpec, root: Path,
+                             board_tasks: Sequence[Dict[str, Any]]
+                             ) -> List[SpecFinding]:
+    """Tests import from a package whose ``__init__.py`` no task creates.
+
+    The PEP 420 namespace-package rule hides this from
+    :func:`_unresolvable_internal_imports`: ``src/pkg/`` exists as a directory,
+    so ``from src.pkg import thing`` looks resolvable -- and it is, as a
+    *package*. What does not exist is ``__init__.py``, so the *names* are
+    missing and every such test dies at collection with an ImportError.
+
+    Measured on a real authored board: the Spec Author wrote a test doing
+    ``from src.slatepress import (...)`` for a goal that also asked for
+    ``src/slatepress/__init__.py``, and produced no task for it. The result was
+    four tasks, three of which failed on the same ImportError, each with a
+    *different* diagnosis -- ``spec_ambiguous``, ``env_broken`` -- and none of
+    them mentioning that the package initializer simply did not exist.
+
+    Scans **every** test file on disk, not only this task's own. That matters:
+    the offending test belonged to a task the Critic had dropped, so a
+    per-task scan could not see it -- which is precisely how an orphan test
+    manages to break the whole suite while every task looks individually fine.
+    """
+    owned: Set[str] = set()
+    for raw in board_tasks:
+        if not isinstance(raw, dict):
+            continue
+        for rel in raw.get("target_files") or []:
+            owned.add(str(rel).replace("\\", "/"))
+
+    tests_dir = root / "tests"
+    if not tests_dir.is_dir():
+        return []
+    findings: List[SpecFinding] = []
+    seen: Set[str] = set()
+    for path in sorted(tests_dir.rglob("test_*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, SyntaxError):
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level:
+                continue
+            module = node.module or ""
+            if not module or not _looks_internal(module, root):
+                continue
+            pkg_dir = root / module.replace(".", "/")
+            init = f"{module.replace('.', '/')}/__init__.py"
+            if not pkg_dir.is_dir() or (root / init).exists() or init in owned:
+                continue  # has an initializer, or a task will write one
+            # PEP 420 still satisfies this import when the names are submodules
+            # of the package: `from src.data import provider` resolves to
+            # src/data/provider.py with no __init__.py anywhere. Only a name the
+            # package does not contain needs the initializer to define it --
+            # which is the case that actually breaks collection.
+            absent = sorted(
+                alias.name for alias in node.names
+                if alias.name != "*"
+                and not (pkg_dir / f"{alias.name}.py").exists()
+                and not (pkg_dir / alias.name).is_dir()
+                and alias.name != "__init__")
+            if not absent:
+                continue
+            if module in seen:
+                continue
+            seen.add(module)
+            findings.append(SpecFinding(
+                "package_init_unowned",
+                f"{path.name} does 'from {module} import {', '.join(absent)}', "
+                f"but {module} has no __init__.py, no task creates one, and "
+                f"those names are not submodules of it. The import fails at "
+                f"collection. Either a task must own "
+                f"{module.replace('.', '/')}/__init__.py and re-export them, "
+                f"or the test must import the submodule that defines each one.",
+                severity="high"))
+    return findings
+
+
 def project_structure_findings(task: TaskSpec,
                                project_root: Path) -> List[SpecFinding]:
     """Board-level structural checks, from one task's point of view.
@@ -1045,15 +1125,22 @@ def project_structure_findings(task: TaskSpec,
     board = load_board(project_root)
     if board is None or not impl_targets:
         return findings
+    # Whole-board properties first, before the "are there other tasks" early
+    # return below: a single-task board still has to be checked for them. Putting
+    # them after meant the first version silently found nothing on a one-task
+    # board, which is exactly the shape of the fixture that caught it.
+    for finding in _duplicate_symbol_findings(task, Path(project_root),
+                                             board.get("tasks") or []):
+        findings.append(finding)
+    for finding in _unowned_package_imports(task, Path(project_root),
+                                            board.get("tasks") or []):
+        findings.append(finding)
+
     board_tasks = [t for t in (board.get("tasks") or [])
                    if isinstance(t, dict) and str(t.get("id")) != task.id]
     others = board_tasks
     if not others:
         return findings
-
-    for finding in _duplicate_symbol_findings(task, Path(project_root),
-                                                  board.get("tasks") or []):
-        findings.append(finding)
 
     owned = {str(t.get("id")) for t in others
              if str(t.get("id")) in (task.dependencies or [])}

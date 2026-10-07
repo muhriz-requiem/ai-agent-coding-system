@@ -656,9 +656,19 @@ def test_critic_is_silent_on_every_completed_task_in_the_workspace():
     blocked: list = []
     for board_path in boards:
         board = json.loads(board_path.read_text(encoding="utf-8"))
+        tasks = board.get("tasks", [])
+        # v2.9.1: scope this to boards that actually *completed*. The test's
+        # claim is that the Critic does not block work that demonstrably
+        # succeeded; a board mid-build is expected to have findings, and the
+        # slatepress run had a genuinely blocking one (no task owned
+        # src/slatepress/__init__.py while a test imported the package). Linting
+        # an unfinished board against "must be silent" would have forced that
+        # finding down to medium and defeated the check.
+        if not tasks or any(t.get("status") != "done" for t in tasks):
+            continue
         # .../projects/<name>/.agent/task_board.json -> <name> is parents[1].
         project_root = board_path.parents[1]
-        for raw in board.get("tasks", []):
+        for raw in tasks:
             task, err = validate_or_error(TaskSpec, raw)
             if err:
                 continue
@@ -1168,3 +1178,133 @@ def test_duplicate_symbol_is_silent_on_the_reference_board():
     # ledgerline is the known-bad board this check exists to describe; every
     # other board must be silent.
     assert set(hits) <= {"ledgerline/T-003", "ledgerline/T-004"}, hits
+
+# ================================ A package nobody owns an initializer for
+def test_flags_a_test_importing_names_from_an_unowned_package(tmp_path):
+    """Found on a real authored board: 3 of 4 tasks failed on one ImportError.
+
+    The goal asked for ``src/slatepress/__init__.py``; the Spec Author wrote a
+    test doing ``from src.slatepress import split_front_matter`` and produced no
+    task for the initializer. Three tasks then failed with the same collection
+    error but three *different* diagnoses -- spec_ambiguous, env_broken,
+    missing_module -- and none of them said the initializer did not exist.
+    """
+    root = Path(tempfile.mkdtemp())
+    (root / "src" / "pkg").mkdir(parents=True)
+    (root / "src" / "pkg" / "frontmatter.py").write_text("def parse(): pass\n",
+                                                        encoding="utf-8")
+    (root / "tests").mkdir()
+    (root / "tests" / "test_pkg.py").write_text(
+        "from src.pkg import parse\n\n\ndef test_e():\n    assert parse\n",
+        encoding="utf-8")
+    board = [{"id": "T-1", "title": "frontmatter",
+              "objective": "Implement parse in src/pkg/frontmatter.py.",
+              "target_files": ["src/pkg/frontmatter.py"],
+              "dependencies": [], "acceptance_criteria": []}]
+    (root / ".agent").mkdir()
+    (root / ".agent" / "task_board.json").write_text(
+        json.dumps({"tasks": board}), encoding="utf-8")
+    task, err = validate_or_error(TaskSpec, board[0])
+    assert err is None, err
+    hits = [f for f in spec_critic.deterministic_checks(task, root).blocking
+            if f.kind == "package_init_unowned"]
+    assert hits, "a name the package does not contain needs an __init__.py"
+    assert "parse" in hits[0].detail
+
+
+def test_namespace_package_submodule_import_is_fine(tmp_path):
+    """PEP 420 satisfies ``from src.data import provider`` with no __init__.py.
+
+    The reference board does exactly this in six places and all of them pass, so
+    flagging a bare package import would have blocked 20 delivered tasks.
+    """
+    root = Path(tempfile.mkdtemp())
+    (root / "src" / "data").mkdir(parents=True)
+    (root / "src" / "data" / "provider.py").write_text("X = 1\n",
+                                                      encoding="utf-8")
+    (root / "tests").mkdir()
+    (root / "tests" / "test_data.py").write_text(
+        "from src.data import provider\n\n\n"
+        "def test_e():\n    assert provider.X == 1\n", encoding="utf-8")
+    board = [{"id": "T-1", "title": "provider",
+              "objective": "Implement src/data/provider.py.",
+              "target_files": ["src/data/provider.py"],
+              "dependencies": [], "acceptance_criteria": []}]
+    (root / ".agent").mkdir()
+    (root / ".agent" / "task_board.json").write_text(
+        json.dumps({"tasks": board}), encoding="utf-8")
+    task, err = validate_or_error(TaskSpec, board[0])
+    assert err is None, err
+    assert not [f for f in spec_critic.deterministic_checks(task, root).blocking
+                if f.kind == "package_init_unowned"]
+
+
+def test_a_task_that_owns_the_initializer_clears_the_finding(tmp_path):
+    root = Path(tempfile.mkdtemp())
+    (root / "src" / "pkg").mkdir(parents=True)
+    (root / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "src" / "pkg" / "frontmatter.py").write_text("def parse(): pass\n",
+                                                        encoding="utf-8")
+    (root / "tests").mkdir()
+    (root / "tests" / "test_pkg.py").write_text(
+        "from src.pkg import parse\n\n\ndef test_e():\n    assert parse\n",
+        encoding="utf-8")
+    board = [{"id": "T-1", "title": "pkg", "objective": "Own __init__.py.",
+              "target_files": ["src/pkg/__init__.py"], "dependencies": [],
+              "acceptance_criteria": []}]
+    (root / ".agent").mkdir()
+    (root / ".agent" / "task_board.json").write_text(
+        json.dumps({"tasks": board}), encoding="utf-8")
+    task, err = validate_or_error(TaskSpec, board[0])
+    assert err is None, err
+    assert not [f for f in spec_critic.deterministic_checks(task, root).blocking
+                if f.kind == "package_init_unowned"]
+
+
+def test_orphan_authored_tests_are_removed_not_left_behind(tmp_path):
+    """A contract with no implementation task is not a contract.
+
+    Stage 2 writes every planned task's test before the Critic runs, because the
+    Critic needs them on disk. A task the Critic then blocks therefore leaves
+    its test behind, and those orphans break collection for the whole suite and
+    inflate the gate's baseline -- observed as 6 test files for 4 tasks.
+    """
+    from project_orchestrator import ProjectOrchestrator
+
+    root = tmp_path / "projects" / "demo"
+    (root / "tests").mkdir(parents=True)
+    (root / "src" / "pkg").mkdir(parents=True)
+    (root / ".agent").mkdir(parents=True)
+    (root / ".agent" / "task_board.json").write_text(
+        json.dumps({"tasks": []}), encoding="utf-8")
+
+    kept = root / "tests" / "test_kept.py"
+    kept.write_text("def test_a(): pass\n", encoding="utf-8")
+    dropped = root / "tests" / "test_dropped.py"
+    dropped.write_text("def test_b(): pass\n", encoding="utf-8")
+    outside = root / "src" / "pkg" / "helper_test.py"
+    outside.write_text("x = 1\n", encoding="utf-8")
+
+    class FakeTask:
+        id = "T-9"
+
+    class FakeAuthored:
+        def __init__(self, task_id, path, usable):
+            self.task = FakeTask() if task_id == "T-1" else None
+            self.test_path = path
+            self.usable = usable
+
+    class FakePlan:
+        tasks = [
+            FakeAuthored("T-1", "tests/test_kept.py", True),
+            FakeAuthored("T-2", "tests/test_dropped.py", False),
+            FakeAuthored("T-3", "src/pkg/helper_test.py", False),
+        ]
+
+    orch = ProjectOrchestrator(workspace_root=tmp_path, project_name="demo")
+    removed = orch._remove_orphan_authored_tests(FakePlan(), {"T-1"})
+
+    assert removed == ["tests/test_dropped.py"], removed
+    assert kept.exists(), "an activated task's test must survive"
+    assert not dropped.exists(), "the blocked task's test must be removed"
+    assert outside.exists(), "never delete outside tests/"

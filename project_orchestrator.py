@@ -1893,6 +1893,21 @@ class ProjectOrchestrator:
         for task in plan.tasks:
             if task.task is not None and task.task.id not in keep:
                 task.rejected = "spec critic blocked activation"
+        # v2.9.1: delete the tests of the tasks we just dropped.
+        #
+        # Stage 2 writes every planned task's test file *before* the Critic runs,
+        # because the Critic needs them on disk to check them. So a task the
+        # Critic blocks leaves its test behind with no task to satisfy it.
+        #
+        # Measured on the slatepress board: 6 test files for 4 tasks, two of
+        # them (`test_markdown.py`, `test_slatepress.py`) testing modules no task
+        # owned. Those orphans are not inert -- they break collection for the
+        # whole suite and inflate the gate's baseline, so the suite reads as
+        # broken for reasons no board entry explains. A contract with no
+        # implementation task is not a contract.
+        removed_tests = self._remove_orphan_authored_tests(plan, keep)
+        if removed_tests:
+            written = [p for p in written if p not in removed_tests]
 
         entries = spec_author.board_entries(plan)
         if not entries:
@@ -1922,6 +1937,47 @@ class ProjectOrchestrator:
                 spec_author.needs_conftest(plan, self.project_root):
             self._write_root_conftest()
         return True
+
+    def _remove_orphan_authored_tests(self, plan: Any,
+                                     keep: Set[str]) -> List[str]:
+        """Delete test files written for tasks that were not activated.
+
+        Only ever removes a file this authoring pass itself created: the path
+        must be inside the project's ``tests/`` directory and must have been
+        recorded in ``plan`` as a written test. A pre-existing test the operator
+        wrote is never a candidate, and the guard is checked before the unlink
+        rather than trusted.
+        """
+        removed: List[str] = []
+        tests_dir = (self.project_root / "tests").resolve()
+        for authored in plan.tasks:
+            if authored.usable or not authored.test_path:
+                continue
+            task_id = authored.task.id if authored.task is not None else ""
+            if task_id in keep:
+                continue
+            candidate = (self.project_root / authored.test_path).resolve()
+            try:
+                candidate.relative_to(tests_dir)
+            except ValueError:
+                continue  # outside tests/ -- never ours to remove
+            if not candidate.is_file():
+                continue
+            try:
+                candidate.unlink()
+            except OSError as exc:
+                log_event("WARNING", "spec_author_orphan_test_kept",
+                          {"project": self.project_name,
+                           "test": authored.test_path,
+                           "error": str(exc)[:150]})
+                continue
+            removed.append(authored.test_path)
+            log_event("INFO", "spec_author_orphan_test_removed",
+                      {"project": self.project_name, "task_id": task_id,
+                       "test": authored.test_path,
+                       "note": "the Critic blocked this task, so its test has "
+                               "no implementation to grade"})
+        return removed
 
     def _refresh_lines(self) -> None:
         """Recompute and publish the line partition (v2.9).
