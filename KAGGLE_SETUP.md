@@ -6,7 +6,7 @@ This file captures the state of the Kaggle domain pack (v2.6) so future coding-a
 
 | Item | Where | How |
 |---|---|---|
-| Kaggle API token | kaggle.com → Settings → API → Create New Token | `literal:%USERPROFILE%\.kaggle\kaggle.json` |
+| Kaggle API token | kaggle.com → Settings → API → Create New Token | `%USERPROFILE%\.kaggle\kaggle.json` |
 | Kaggle CLI | `pip install kaggle` | Already installed (added to `requirements.txt`) |
 | Competition rules | kaggle.com — accept on the competition page | Required before submit works |
 | Competition data | `kaggle competitions download -c <slug>` → `projects/<name>/data/raw/` | Or manual download |
@@ -168,7 +168,7 @@ tail -f logs/agent_log.jsonl           # live event stream (candidate_scored, ob
 
 ```
 1.  mkdir -p ${USERPROFILE}\.kaggle
-    # paste the API token into literal:%USERPROFILE%\.kaggle\kaggle.json
+    # paste the API token into %USERPROFILE%\.kaggle\kaggle.json
 2.  Accept the competition rules on kaggle.com
 3.  python main.py --new-kaggle my_comp --competition <slug> --metric <name> ...
 4.  Download data: kaggle competitions download -c <slug> -p projects/my_comp/data/raw/
