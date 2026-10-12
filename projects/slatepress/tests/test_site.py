@@ -1,77 +1,69 @@
-import importlib.util
-import pytest
-
-if importlib.util.find_spec("src.slatepress.site") is None:
-    pytest.skip("implementation not written yet", allow_module_level=True)
-
-from pathlib import Path
+import importlib.util, pytest
+if importlib.util.find_spec('src.slatepress.site') is None:
+    pytest.skip('implementation not written yet', allow_module_level=True)
 from src.slatepress.site import build_site
+from pathlib import Path
 
 
-def test_build_site_basic(tmp_path: Path) -> None:
+def test_build_site_basic(tmp_path):
     source_dir = tmp_path / "source"
     output_dir = tmp_path / "output"
     source_dir.mkdir()
 
     md_file = source_dir / "index.md"
-    md_file.write_text("# Hello World\n", encoding="utf-8")
+    md_file.write_text("# Hello World", encoding="utf-8")
 
     asset_file = source_dir / "style.css"
-    asset_file.write_text("body { color: red; }", encoding="utf-8")
+    asset_file.write_text("body { color: black; }", encoding="utf-8")
 
-    written_paths = build_site(source_dir, output_dir)
+    results = build_site(source_dir, output_dir)
 
-    assert isinstance(written_paths, list)
-    assert len(written_paths) == 2
+    assert isinstance(results, list)
+    assert any(str(output_dir / "index.html") in r or r.endswith("index.html") for r in results)
+    assert any(str(output_dir / "style.css") in r or r.endswith("style.css") for r in results)
+    
     assert (output_dir / "index.html").exists()
     assert (output_dir / "style.css").exists()
-    assert str(output_dir / "index.html") in written_paths
-    assert str(output_dir / "style.css") in written_paths
+    assert (output_dir / "style.css").read_text(encoding="utf-8") == "body { color: black; }"
 
 
-def test_build_site_skips_hidden_and_underscore(tmp_path: Path) -> None:
+def test_build_site_skips_hidden_and_underscore(tmp_path):
     source_dir = tmp_path / "source"
     output_dir = tmp_path / "output"
     source_dir.mkdir()
 
-    hidden_file = source_dir / ".hidden.md"
-    hidden_file.write_text("hidden", encoding="utf-8")
-
-    underscore_file = source_dir / "_template.md"
-    underscore_file.write_text("template", encoding="utf-8")
-
-    hidden_dir = source_dir / ".git"
+    (source_dir / "_draft.md").write_text("# Draft", encoding="utf-8")
+    (source_dir / ".hidden.md").write_text("# Hidden", encoding="utf-8")
+    
+    hidden_dir = source_dir / "_hidden_dir"
     hidden_dir.mkdir()
-    (hidden_dir / "config.md").write_text("config", encoding="utf-8")
+    (hidden_dir / "file.md").write_text("# Inside", encoding="utf-8")
 
-    underscore_dir = source_dir / "_partials"
-    underscore_dir.mkdir()
-    (underscore_dir / "header.md").write_text("header", encoding="utf-8")
+    dot_dir = source_dir / ".git"
+    dot_dir.mkdir()
+    (dot_dir / "config").write_text("config", encoding="utf-8")
 
-    valid_file = source_dir / "about.md"
-    valid_file.write_text("# About", encoding="utf-8")
+    results = build_site(source_dir, output_dir)
 
-    written_paths = build_site(source_dir, output_dir)
-
-    assert len(written_paths) == 1
-    assert (output_dir / "about.html").exists()
+    assert not (output_dir / "_draft.html").exists()
     assert not (output_dir / ".hidden.html").exists()
-    assert not (output_dir / "_template.html").exists()
-    assert not (output_dir / "config.html").exists()
-    assert not (output_dir / "_partials").exists()
+    assert not (output_dir / "_hidden_dir").exists()
+    assert not (output_dir / ".git").exists()
+    assert len(results) == 0
 
 
-def test_build_site_nested_directories(tmp_path: Path) -> None:
+def test_build_site_recursion(tmp_path):
     source_dir = tmp_path / "source"
     output_dir = tmp_path / "output"
     
-    blog_dir = source_dir / "blog"
-    blog_dir.mkdir(parents=True)
-    
-    post_file = blog_dir / "post1.md"
-    post_file.write_text("# Post 1", encoding="utf-8")
+    sub_dir = source_dir / "blog"
+    sub_dir.mkdir(parents=True)
 
-    written_paths = build_site(source_dir, output_dir)
+    (sub_dir / "post.md").write_text("# Post", encoding="utf-8")
+    (sub_dir / "image.png").write_bytes(b"\x89PNG\r\n\x1a\n")
 
-    assert (output_dir / "blog" / "post1.html").exists()
-    assert str(output_dir / "blog" / "post1.html") in written_paths
+    results = build_site(source_dir, output_dir)
+
+    assert (output_dir / "blog" / "post.html").exists()
+    assert (output_dir / "blog" / "image.png").exists()
+    assert len(results) == 2

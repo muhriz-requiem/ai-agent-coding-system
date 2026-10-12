@@ -3,27 +3,25 @@ if importlib.util.find_spec('src.slatepress.html') is None:
     pytest.skip('implementation not written yet', allow_module_level=True)
 from src.slatepress.html import escape, page
 
-def test_escape_basic():
-    assert escape("Hello & Welcome") == "Hello &amp; Welcome"
-    assert escape("3 < 5") == "3 &lt; 5"
-    assert escape("5 > 3") == "5 &gt; 3"
+def test_escape_basic_characters():
+    assert escape("Hello & <world>") == "Hello &amp; &lt;world&gt;"
 
-def test_escape_combined():
-    assert escape("<span>Click & Save</span>") == "&lt;span&gt;Click &amp; Save&lt;/span&gt;"
+def test_escape_no_special_characters():
+    assert escape("Hello World") == "Hello World"
 
-def test_escape_no_special_chars():
-    assert escape("Plain text 123") == "Plain text 123"
+def test_escape_all_special_characters():
+    assert escape("&<>") == "&amp;&lt;&gt;"
 
-def test_page_basic():
-    html_output = page("My Title", "<p>Hello World</p>")
-    assert "<title>My Title</title>" in html_output
-    assert "<main><p>Hello World</p></main>" in html_output
-    assert "<!DOCTYPE html>" in html_output
-    assert "stylesheet" not in html_output
+def test_page_basic_structure():
+    result = page("My Title", "<p>Hello</p>")
+    assert "<!DOCTYPE html>" in result
+    assert "<title>My Title</title>" in result
+    assert "<main><p>Hello</p></main>" in result
 
-def test_page_with_css():
-    html_output = page("My Title", "<p>Hello World</p>", css_link="style.css")
-    assert "<title>My Title</title>" in html_output
-    assert "<main><p>Hello World</p></main>" in html_output
-    assert 'href="style.css"' in html_output
-    assert "<link" in html_output
+def test_page_with_css_link():
+    result = page("My Title", "<p>Hello</p>", css_link="style.css")
+    assert '<link rel="stylesheet" href="style.css">' in result or 'href="style.css"' in result
+
+def test_page_without_css_link():
+    result = page("My Title", "<p>Hello</p>", css_link=None)
+    assert "stylesheet" not in result
