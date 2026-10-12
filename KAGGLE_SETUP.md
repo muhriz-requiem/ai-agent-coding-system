@@ -10,7 +10,7 @@ This file captures the state of the Kaggle domain pack (v2.6) so future coding-a
 | Kaggle CLI | `pip install kaggle` | Already installed (added to `requirements.txt`) |
 | Competition rules | kaggle.com — accept on the competition page | Required before submit works |
 | Competition data | `kaggle competitions download -c <slug>` → `projects/<name>/data/raw/` | Or manual download |
-| `KAGGLE_USERNAME` / `KAGGLE_KEY` | In `literal:<repo-root>\.env` as commented placeholders | Uncomment and fill if you prefer env vars over the file |
+| `KAGGLE_USERNAME` / `KAGGLE_KEY` | In the repo's `.env` as commented placeholders | Uncomment and fill if you prefer env vars over the file |
 
 ## Scaffold a campaign
 

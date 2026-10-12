@@ -30,8 +30,8 @@ Concretely, in order of preference:
 
    ```powershell
    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command `
-     "& 'literal:<path-to>\run-and-wait.ps1' -Name <label> -FilePath python `
-        -ArgList @('main.py','--once') -WorkDir 'literal:<repo-root>' `
+     "& '<path-to>\run-and-wait.ps1' -Name <label> -FilePath python `
+        -ArgList @('main.py','--once') -WorkDir '<repo-root>' `
         -MaxMinutes 8 -PollSeconds 25"
    ```
 
