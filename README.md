@@ -1,9 +1,8 @@
 # Enterprise Multi-Agent Coding System
 
 A 3-tier hierarchical multi-agent coding orchestrator (Python 3.10+, Pydantic v2)
-targeting the OpenRouter API, with an optional OpenCode CLI adapter. Runs end-to-end
-offline in DEMO_MODE. Includes a Kaggle domain pack, a secrets-and-egress layer, and a
-circuit breaker.
+targeting the OpenRouter API. Runs end-to-end offline in DEMO_MODE. Includes a Kaggle
+domain pack, a secrets-and-egress layer, and a circuit breaker.
 
 > ## Why this repository is published
 >
@@ -25,9 +24,18 @@ worked.**
 
 | Project | Tests | Escalations | What was actually broken |
 |---|---|---|---|
-| `slatepress` | 21/21 pass | 0 | `blocks()` — half the spec (headings, fenced code, lists) — was **never written**. The task board skips `T-004`. The build "succeeded". |
-| `ledgerline` | 26/26 pass | 13 | Four modules define **four mutually incompatible `JournalEntry` classes**. `trial_balance.py` reads attributes the real objects don't have. `reports.py` reads an attribute nothing sets, so it returns all zeros. |
+| `slatepress` | 21/21 pass | 0 | The spec required a package `__init__.py` re-exporting `blocks()` (headings, fenced code, lists) among others. **It was never written** — and the spec-derived test that asserted it was deleted when the suite was split. `markdown.py` ships with only `inline_markup`. The task board has no task for it. |
+| `ledgerline` | 26/26 pass | 13 | Three modules define **three mutually incompatible `JournalEntry` classes**. `trial_balance.py` reads attributes the real objects don't have. `reports.py` reads an attribute nothing sets, so it returns all zeros. |
 | `logtriage` | 105/105 pass | 12 | Two tasks were **hand-completed by me**, not the Builder. The reasoning is in the source docstrings. |
+
+`slatepress` is the sharpest case, and the fix that was applied makes it worse, not
+better. Its original spec-derived test — 8 assertions that the package re-exports its
+public API, including `blocks` — **could never have passed**, because the `__init__.py`
+was never written. When the suite was reorganised into per-module tests, that file was
+deleted. Nothing replaced it. The remaining five test files import submodules directly
+(`from src.slatepress.frontmatter import ...`), so they never touch the package
+contract. Green suite, missing requirement, and the test that would have caught it
+deleted in the same operation.
 
 The failure mode is consistent: **the agents satisfy the API surface without satisfying
 the behaviour.** Tests written against a spec's signatures pass whether or not the code

@@ -1,4 +1,16 @@
-# project_main
+# project_main — LLM-driven equities paper-trading pipeline
+
+> **This directory is a duplicate.** This project is published on its own, with a
+> rewritten README and a scrubbed data directory, at
+> **https://github.com/muhriz-requiem/llm-equities-paper-trading** — that is the copy to
+> read. What follows is the original internal README, kept here because
+> `project_main` is the reference implementation this orchestrator was built against.
+>
+> It is also the one project in this repo where the agents did *not* fail in the way the
+> three test projects did: 666 tests, 20 tasks, no escalations. The difference is that
+> it was built tests-first with a hand-written spec, rather than from a one-line goal.
+> Its trading result is negative — the edge does not survive transaction costs — and the
+> README says so at length.
 
 LLM-driven paper-trading pipeline for equities. Fetches market data, runs quant signals + AI analysts through bull/bear debate, applies deterministic risk veto, sizes orders, submits to Alpaca paper API.
 
