@@ -1,0 +1,49 @@
+{
+  "schema": "portfolio-registry/1.0",
+  "maintained_by": "operator",
+  "purpose_vocabulary": ["internal", "deliverable", "research"],
+  "decision": "2026-11-08: registry-classification of projects/, no physical moves (see OVERHAUL_PLAN.md Phase 8b extension)",
+  "_doc": "purpose = who the project is FOR, orthogonal to the file-derived lifecycle kind in portfolio.json. Missing-level fallback in portfolio.load_registry is unregistered; entries with a purpose outside purpose_vocabulary are ignored. Registered-but-absent names are ghosts: they affect nothing.",
+  "projects": {
+    "boardscan": {
+      "purpose": "internal",
+      "note": "operator CLI that surveys this workspace's own task boards"
+    },
+    "logtriage": {
+      "purpose": "internal",
+      "note": "analyzes the orchestrator's own event logs (llm_usage, provider cooldowns); board present, goal.txt pending write-back"
+    },
+    "slatepress": {
+      "purpose": "internal",
+      "note": "the sight lane's V5 canary: expected_views/T-005.json contract is workspace infrastructure"
+    },
+    "ledgerline": {
+      "purpose": "deliverable",
+      "note": "stdlib-only double-entry bookkeeping library"
+    },
+    "qreturns": {
+      "purpose": "deliverable",
+      "note": "stdlib-only returns-metrics library + CLI (staged export pending operator approval)"
+    },
+    "modinstall": {
+      "purpose": "deliverable",
+      "note": "package installer built from the curseforge research SPEC (staged export pending operator approval)"
+    },
+    "project_alpha": {
+      "purpose": "deliverable",
+      "note": "single-task demo scaffold (JWT middleware), prior-phase"
+    },
+    "project_beta": {
+      "purpose": "deliverable",
+      "note": "single-task demo scaffold consuming shared_util, prior-phase"
+    },
+    "project_main": {
+      "purpose": "deliverable",
+      "note": "LLM-driven Alpaca paper-trading pipeline, independent product"
+    },
+    "curseforge-install-study": {
+      "purpose": "research",
+      "note": "boardless REA evidence study feeding modinstall (source of the task_board_unreadable cycle noise)"
+    }
+  }
+}

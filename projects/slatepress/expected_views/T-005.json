@@ -1,0 +1,12 @@
+{
+  "task_id": "T-005",
+  "view_command": "python .agent/v5_render.py",
+  "url_or_path": ".agent/canary_site/index.html",
+  "viewports": ["1280x800"],
+  "must_contain": ["Welcome to slatepress"],
+  "dom_asserts": [
+    {"type": "tag_present", "tag": "main"},
+    {"type": "headings_ascending"}
+  ],
+  "screenshot_required": true
+}
